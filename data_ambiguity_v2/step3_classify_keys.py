@@ -6,6 +6,7 @@ import math
 import numpy as np
 import os
 import pandas as pd
+import random
 import re
 import statistics
 #mport statsmodels.api as sm
@@ -17,13 +18,13 @@ warnings.filterwarnings("ignore")
 
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from imblearn.over_sampling import RandomOverSampler
+from imblearn.over_sampling import RandomOverSampler, SMOTE
 from itertools import chain, combinations, islice
 from scipy.spatial.distance import cosine
 from sklearn.ensemble import RandomForestClassifier 
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import precision_recall_fscore_support
-from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.metrics import precision_recall_fscore_support, classification_report
+from sklearn.model_selection import LeaveOneGroupOut, train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.svm import SVC
@@ -442,7 +443,7 @@ def find_best_features_combination(columns):
     Purpose: Come up with all the possible combinations that can be made with all the predictors (features)
     '''
     features = list(columns)
-    return chain.from_iterable(combinations(features, i) for i in range(6, len(features) + 1)) 
+    return chain.from_iterable(combinations(features, i) for i in range(2, 6)) 
 
 
 def print_misclassified_keys(df, test_idx, y_pred, y_test, afile):
@@ -450,7 +451,6 @@ def print_misclassified_keys(df, test_idx, y_pred, y_test, afile):
     Input: dataframe, index of the test split, predictions, test set, file
     Purpose: Write to a file keys that are mis-classified
     '''
-
     for (index, (prediction, label)) in enumerate(zip(y_pred, y_test)):
         if prediction != label:
             df_index = test_idx[index]
@@ -459,15 +459,16 @@ def print_misclassified_keys(df, test_idx, y_pred, y_test, afile):
 
 def extract_pattern_properties_parents(schema, path=[]):
     if isinstance(schema, dict):
+        if 'patternProperties' in schema:
+            yield path
+        elif 'properties' not in schema and schema.get('additionalProperties', False) is not False:
+            yield path
+
         for key, value in schema.items():
-            if key == "patternProperties":
-                if 'type' in schema:
-                    yield path + [key]
-            if isinstance(value, (dict, list)):
-                yield from extract_pattern_properties_parents(value, path + [key])
+            yield from extract_pattern_properties_parents(value, path + [key])
+                
     elif isinstance(schema, list):
         for index, item in enumerate(schema):
-            #extract_pattern_properties_parents(item, path + [str(index)])
             yield from extract_pattern_properties_parents(item, path)
 
 
@@ -515,17 +516,17 @@ def label_paths(dataset, df, dynamic_paths, keys_to_remove):
     return df
 
 
-def preprocess_data(files_folder):
+def preprocess_data(files_folder, group):
     keys_to_remove = ["definitions", "$defs", "properties", "patternProperties", "oneOf", "allOf", "anyOf", "items"]
     frames = []
 
     for dataset in os.listdir(files_folder):
-        schema_path = os.path.join("schemas", dataset)
+        schema_path = os.path.join("valid_schemas", dataset)
         with open(schema_path, 'r') as schema_file:
             json_schema = json.load(schema_file)
 
         doc_list = []
-        file_path = os.path.join("fake_files", dataset)
+        file_path = os.path.join(files_folder, dataset)
         with open(file_path, 'r') as file:
             lines = islice(file, 50)
             for line in lines:
@@ -538,8 +539,14 @@ def preprocess_data(files_folder):
         
         sys.stderr.write(f"Creating a dataframe for {dataset}\n")
         df = parse_dataset(doc_list, dataset)
+        
         sys.stderr.write(f"Calculating features for {dataset}\n")
-        df = calculate_nested_keys_stats(df, set())
+        if group == "yes":
+            df, all_cluster_keys_group = group_keys(df)
+            df = calculate_nested_keys_stats(df, all_cluster_keys_group)
+        else:
+            df = calculate_nested_keys_stats(df, set())
+
         sys.stderr.write(f"Labeling data for {dataset}\n")
         df = label_paths(dataset, df, dynamic_paths, keys_to_remove)
         frames.append(df)
@@ -549,7 +556,16 @@ def preprocess_data(files_folder):
     return df
 
 
-def choose_classifier(X, y, df, features, writer):
+def apply_classifier(model, X_train, y_train, X_test, y_test, features, writer):
+    result = model.fit(X_train, y_train)
+    y_pred = (result.predict(X_test) >= 0.5).astype(int)
+    #y_pred = result.predict(X_test)
+    #print(classification_report(y_test, y_pred))
+    precision, recall, f1_score, _ = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
+    writer.writerow([type(model).__name__, features, precision, recall, f1_score])
+
+
+def classify(X, y, df, features, writer, testing_size, random_value, use_logo=True):
     '''
     Input: X = Array of features values, y = dependent values, columns = headers of dataframe, df = merged dataframe
     Output: classification results
@@ -569,67 +585,99 @@ def choose_classifier(X, y, df, features, writer):
     mlp_f1_scores = []
     #jx_precisions = [], jx_recalls = [], jx_f1_scores = []
 
-    logo = LeaveOneGroupOut()
-    groups, _ = pd.factorize(df['Filename'])
     scaler = MinMaxScaler()
+    
 
-    lr = LogisticRegression(random_state = 42)
-    rf = RandomForestClassifier(n_estimators = 100, random_state = 42)
+    lr = LogisticRegression(random_state = random_value)
+    rf = RandomForestClassifier(n_estimators=100, random_state = random_value)
     svm = SVC() 
-    mlp = MLPClassifier(hidden_layer_sizes = (100, 50), max_iter = 1000, random_state = 42) 
- 
+    mlp = MLPClassifier(hidden_layer_sizes = (100, 50), max_iter = 1000, random_state = random_value) 
+    # try more complicated neural networks!!!!!!!!!!!!!!!!!
 
-    # Split the data into groups for testing and training
-    for train_idx, test_idx in logo.split(X, y, groups):
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    if use_logo:
+        logo = LeaveOneGroupOut()
+        groups, _ = pd.factorize(df['Filename'])
 
-        # Preprocess data
-        ros = RandomOverSampler(sampling_strategy = 0.7)
+        # Split the data into groups for testing and training
+        for train_idx, test_idx in logo.split(X, y, groups):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+
+            # Preprocess data
+            ros = RandomOverSampler(sampling_strategy = 0.5)
+            X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
+            X_train_scaled = scaler.fit_transform(X_train_resampled)
+            X_test_scaled = scaler.transform(X_test) 
+            
+            # Perform logistic regression
+            result = lr.fit(X_train_scaled, y_train_resampled)
+            y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)
+            precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
+            lr_precisions.append(precision)
+            lr_recalls.append(recall)
+            lr_f1_scores.append(f1_score)
+            
+            # Perform random forest
+            result = rf.fit(X_train_scaled, y_train_resampled)
+            y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)
+            precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
+            rf_precisions.append(precision)
+            rf_recalls.append(recall)
+            rf_f1_scores.append(f1_score)
+
+            # Perform support vector machines                           
+            result = svm.fit(X_train_scaled, y_train_resampled)
+            y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)     
+            precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
+            svm_precisions.append(precision)
+            svm_recalls.append(recall)
+            svm_f1_scores.append(f1_score)
+
+            # Perform MLP                        
+            result = mlp.fit(X_train_scaled, y_train_resampled)
+            y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)     
+            precision, recall, f1_score, _ = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
+            mlp_precisions.append(precision)
+            mlp_recalls.append(recall)
+            mlp_f1_scores.append(f1_score)
+            
+        sys.stderr.write(f" Writing to file results with the features: {features} \n")
+        writer.writerow(["LR", features, np.mean(lr_precisions), np.mean(lr_recalls), np.mean(lr_f1_scores), np.std(lr_f1_scores)])
+        writer.writerow(["RF", features, np.mean(rf_precisions), np.mean(rf_recalls), np.mean(rf_f1_scores), np.std(rf_f1_scores)])
+        writer.writerow(["SVM", features, np.mean(svm_precisions), np.mean(svm_recalls), np.mean(svm_f1_scores), np.std(svm_f1_scores)])    
+        writer.writerow(["MLP", features, np.mean(mlp_precisions), np.mean(mlp_recalls), np.mean(mlp_f1_scores), np.std(mlp_f1_scores)])
+
+    else:
+        # Get a list of unique filenames
+        unique_filenames = df["Filename"].unique()
+
+        # Split the list of filenames into training and testing sets
+        train_filenames, test_filenames = train_test_split(unique_filenames, test_size=testing_size, random_state=random_value)
+
+        # Use the list of filenames to filter the original DataFrame
+        train_df = df[df["Filename"].isin(train_filenames)]
+        test_df = df[df["Filename"].isin(test_filenames)]
+
+        X_train = train_df[features]
+        y_train = train_df["Category"]
+        X_test = test_df[features]
+        y_test = test_df["Category"]
+
+
+        #X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=42, test_size=testing_size)
+        # Oversample and scale
+        ros = RandomOverSampler(sampling_strategy = 0.5)
         X_train_resampled, y_train_resampled = ros.fit_resample(X_train, y_train)
         X_train_scaled = scaler.fit_transform(X_train_resampled)
         X_test_scaled = scaler.transform(X_test) 
-        
-        # Perform logistic regression
-        result = lr.fit(X_train_scaled, y_train_resampled)
-        y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)
-        precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
-        lr_precisions.append(precision)
-        lr_recalls.append(recall)
-        lr_f1_scores.append(f1_score)
-        
-        # Perform random forest
-        result = rf.fit(X_train_scaled, y_train_resampled)
-        y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)
-        precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
-        rf_precisions.append(precision)
-        rf_recalls.append(recall)
-        rf_f1_scores.append(f1_score)
 
-        # Perform support vector machines                           
-        result = svm.fit(X_train_scaled, y_train_resampled)
-        y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)     
-        precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
-        svm_precisions.append(precision)
-        svm_recalls.append(recall)
-        svm_f1_scores.append(f1_score)
+        apply_classifier(lr, X_train_scaled, y_train_resampled, X_test_scaled, y_test, features, writer)
+        apply_classifier(rf, X_train_scaled, y_train_resampled, X_test_scaled, y_test, features, writer)                        
+        apply_classifier(svm, X_train_scaled, y_train_resampled, X_test_scaled, y_test, features, writer)                       
+        apply_classifier(mlp, X_train_scaled, y_train_resampled, X_test_scaled, y_test, features, writer)
 
-        # Perform MLP                        
-        result = mlp.fit(X_train_scaled, y_train_resampled)
-        y_pred = (result.predict(X_test_scaled) >= 0.5).astype(int)     
-        precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
-        mlp_precisions.append(precision)
-        mlp_recalls.append(recall)
-        mlp_f1_scores.append(f1_score)
-            
-    sys.stderr.write(f" Writing to file results with the features: {features} \n")
-    writer.writerow(["LR", features, np.mean(lr_precisions), np.mean(lr_recalls), np.mean(lr_f1_scores), np.std(lr_f1_scores)])
-    writer.writerow(["RF", features, np.mean(rf_precisions), np.mean(rf_recalls), np.mean(rf_f1_scores), np.std(rf_f1_scores)])
-    writer.writerow(["SVM", features, np.mean(svm_precisions), np.mean(svm_recalls), np.mean(svm_f1_scores), np.std(svm_f1_scores)])    
-    writer.writerow(["MLP", features, np.mean(mlp_precisions), np.mean(mlp_recalls), np.mean(mlp_f1_scores), np.std(mlp_f1_scores)])   
-    
 
-def get_features(df, writer):
+def get_features(df, writer, testing_size):
     """
     Input: Merged dataframe, writer object
     Output: Classifier results and summary
@@ -640,11 +688,15 @@ def get_features(df, writer):
     df[["Mean", "Range", "Standard_deviation", "Skewness", "Kurtosis", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]] = df[["Mean", "Range", "Standard_deviation", "Skewness", "Kurtosis", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]].astype(float)
     training_features = ["Percentage", "Nesting_level", "Mean", "Range", "Standard_deviation", "Skewness", "Kurtosis", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]
     #training_features = ["Datatype_entropy", "Key_entropy"]
+    #training_features = ["Mean", "Range", "Standard_deviation", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]
+
     X = df.loc[:, training_features].values
     y = df.Category
+    
+    random_value = 42
 
     # Perform classification using the best features/predictors
-    #choose_classifier(X, y, df, training_features, writer)
+    #classify(X, y, df, training_features, writer, testing_size, random_value, use_logo=False)
 
     
     columns = df.loc[:, training_features].columns
@@ -653,24 +705,35 @@ def get_features(df, writer):
         if len(subset) > 0:
             X = df.loc[:, list(subset)].values
             sys.stderr.write(f"{str(i)} - Classifying using the following columns: {subset}\n")
-            choose_classifier(X, y, df, list(subset), writer)
-
+            #choose_classifier(X, y, df, list(subset), writer)
+            classify(X, y, df, list(subset), writer, testing_size, random_value, use_logo=False)
+    
 
 
 def main():
-    dataset_folder, dynamic_keys_folder = sys.argv[-2:]
+    dataset_folder, testing_size, group, dynamic_keys_folder = sys.argv[-4:]
 
     pd.set_option('display.max_rows', None)
-    df = preprocess_data(dataset_folder)
+    df = preprocess_data(dataset_folder, group)
     df.dropna(inplace=True)
-    df.to_csv("df.csv")
-    #print(df)
-    
+
+    df_file = ""
+    csv_file = ""
+
+    if group == "yes":
+        df_file = "df_grouping.csv"
+        csv_file = "pattern_grouping.csv"
+    else:
+        df_file = "df_no_grouping.csv"
+        csv_file = "pattern_no_grouping.csv"
+
+    df.to_csv(df_file)
+
     sys.stderr.write("Classifying data...\n")
-    f = open("pattern_no_grouping.csv", "a")
+    f = open(csv_file, "a")
     writer = csv.writer(f)
-    writer.writerow(["Model", "Features", "Precision", "Recall", "f1_scores", "Standard_deviation"])
-    get_features(df, writer)
+    writer.writerow(["Model", "Features", "Precision", "Recall", "f1_scores"])
+    get_features(df, writer, float(testing_size))
     
  
 if __name__ == '__main__':
