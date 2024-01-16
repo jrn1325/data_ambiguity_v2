@@ -77,14 +77,17 @@ def process_document(doc, freq_paths_dict, prefix_paths_dict, prefix_types_dict)
         prefix_types_dict[path].add(type(value).__name__)
               
 
-def create_dataframe(dataset_name, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict):
+def create_dataframe(num_docs, dataset_name, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict, prefix_types_dict):
     """Create a dataframe
 
     Args:
+        num_docs (int): total number of JSON documents in a dataset
         dataset_name (str): JSON dataset name
         freq_paths_dict (dict): dictionary of paths and their frequencies
         prefix_paths_dict (dict): dictionary of paths and their prefixes
         prefix_freqs_dict (dict): dictionary of prefixes and their frequencies
+        prefix_nested_keys_freq_dict (dict): dictionary of paths and their nested keys frequencies
+        prefix_types_dict (dict): dictionary of paths' datatype and their prefixes 
 
     Returns:
         2d list: dataframe
@@ -92,10 +95,19 @@ def create_dataframe(dataset_name, freq_paths_dict, prefix_paths_dict, prefix_fr
    
     for(prefix, p_list) in prefix_paths_dict.items(): 
         prefix_freqs_dict[prefix] = [freq_paths_dict[p] for p in p_list]
+
+    # Loop through the frequency path dictionary and record the frequency of each 
+    for (path, freq) in freq_paths_dict.items():
+        # Check if the delimiter is in a path
+        if len(path) > 1:
+            prefix = path[:-1]
+            prefix_nested_keys_freq_dict[prefix].append(freq)
     
     paths = list(freq_paths_dict.keys())
     df = pd.DataFrame({"Path": paths})
-    df = populate_dataframe(df, prefix_paths_dict, prefix_freqs_dict)
+    # Calculate the Jxplain entropy
+    df = is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs)
+    #df = populate_dataframe(num_docs, df, prefix_paths_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict, prefix_types_dict)
     
     df["Filename"] = dataset_name
     
@@ -131,8 +143,7 @@ def populate_dataframe(df, prefix_paths_dict, prefix_freqs_dict):
             
         df.at[key_loc, "Distinct_subkeys"] = list(distinct_subkeys)
 
-    # Calculate the Jxplain entropy
-    #df = is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs)
+    
     # Remove rows of keys that have no nested keys
     df = df[df.Distinct_subkeys.notnull()]
     df.dropna(inplace=True)
@@ -223,7 +234,8 @@ def initialize_dicts():
         defaultdict(lambda: 0),  # freq_paths_dict
         defaultdict(set),  # prefix_paths_dict
         defaultdict(set),  # prefix_types_dict
-        defaultdict(lambda: 0)  # prefix_freqs_dict
+        defaultdict(lambda: 0),  # prefix_freqs_dict
+        defaultdict(list)  #prefix_nested_keys_freq_dict
     )
 
 
@@ -240,16 +252,18 @@ def preprocess_data(files_folder):
             if not dynamic_paths:
                 continue
 
-        freq_paths_dict, prefix_paths_dict, prefix_types_dict, prefix_freqs_dict = initialize_dicts()
+        freq_paths_dict, prefix_paths_dict, prefix_types_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict = initialize_dicts()
+        num_docs = 0
 
         with open(os.path.join(files_folder, dataset), 'r') as file:
             #lines = islice(file, 10)
             for count, line in enumerate(file):
                 json_doc = json.loads(line)
                 process_document(json_doc, freq_paths_dict, prefix_paths_dict, prefix_types_dict)
+                num_docs += count
 
         #sys.stderr.write(f"Creating a dataframe for {dataset}\n")
-        df = create_dataframe(dataset, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict)
+        df = create_dataframe(num_docs, dataset, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict, prefix_types_dict)
             
         #sys.stderr.write(f"Labeling data for {dataset}\n")
         df = label_paths(dataset, df, dynamic_paths, keys_to_remove)
@@ -284,6 +298,9 @@ def preprocess_data(files_folder):
 
 
 def is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs):
+    df["Datatype_entropy"] = np.nan
+    df["Key_entropy"] = np.nan
+
     # Calculate datatype entropy
     for (key, value) in prefix_types_dict.items():
         # Check if values of the nested keys of a set have the same datatype
@@ -387,6 +404,12 @@ def custom_codebert(df, test_size, random_value):
             "learning_rate": learning_rate,
         }
     )
+    wandb.define_metric("accuracy", summary="max")
+    wandb.define_metric("precision", summary="max")
+    wandb.define_metric("recall", summary="max")
+    wandb.define_metric("F1", summary="max")
+    wandb.define_metric("training_loss", summary="min")
+    wandb.define_metric("testing_loss", summary="min")
 
     # Initialize tokenizer, model with adapter and classification head
     tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
@@ -485,21 +508,25 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
             testing_loss = loss_fn(logits, batch["label"])
             total_loss += testing_loss.item()
 
-            # Collect predictions only for instances with true label 1
+            # Get the actual and predicted labels
+            actual_labels = batch["label"].cpu().numpy()
             predictions = torch.round(torch.sigmoid(outputs.logits[:, 0]))
-            true_labels_predictions.extend(predictions[batch["label"] == 1].cpu().numpy())
+
+            # Collect both actual and predicted labels only for instances where actual label is 1
+            true_labels_actuals.extend(actual_labels[actual_labels == 1].tolist())
+            true_labels_predictions.extend(predictions[actual_labels == 1].cpu().numpy())
+
 
     average_loss = total_loss / len(test_loader)
 
     # Convert to PyTorch tensors
+    true_labels_actuals = torch.tensor(actual_labels)
     true_labels_predictions = torch.tensor(true_labels_predictions)
-
-    # Calculate metrics for true labels
-    true_labels = torch.ones_like(true_labels_predictions)
-    accuracy = accuracy_score(true_labels, true_labels_predictions)
-    precision = precision_score(true_labels, true_labels_predictions)
-    recall = recall_score(true_labels, true_labels_predictions)
-    f1 = f1_score(true_labels, true_labels_predictions)
+    
+    accuracy = accuracy_score(true_labels_actuals, true_labels_predictions)
+    precision = precision_score(true_labels_actuals, true_labels_predictions)
+    recall = recall_score(true_labels_actuals, true_labels_predictions)
+    f1 = f1_score(true_labels_actuals, true_labels_predictions)
 
     wandb.log({"testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1, "accuracy": accuracy})
     return average_loss
@@ -521,12 +548,20 @@ def save_model_and_adapter(model):
 
 
 def main():
-    dataset_folder, testing_size = sys.argv[-2:]
+    dataset_folder, test_size = sys.argv[-2:]
     df = preprocess_data(dataset_folder)
     df = df.reset_index(drop = True)
-    df.to_csv("data.csv")
+    '''
+    train_df, test_df = split_data(df, test_size, 101)
+    # Perform Jxplain1
+    y_pred = ((test_df["Datatype_entropy"] == 0) & (test_df["Key_entropy"] > 1)).astype(int)
+    print(len(y_pred), len(y_test))
+    # Calculate the precision, recall, f1-score, and support of dynamic keys
+    precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
+    '''
+    #df.to_csv("data.csv")
     #df = pd.read_csv("data.csv")
-    custom_codebert(df, float(testing_size), 101)
+    custom_codebert(df, float(test_size), 101)
 
  
 if __name__ == '__main__':
