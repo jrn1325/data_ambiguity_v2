@@ -77,17 +77,14 @@ def process_document(doc, freq_paths_dict, prefix_paths_dict, prefix_types_dict)
         prefix_types_dict[path].add(type(value).__name__)
               
 
-def create_dataframe(num_docs, dataset_name, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict, prefix_types_dict):
+def create_dataframe(dataset_name, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict):
     """Create a dataframe
 
     Args:
-        num_docs (int): total number of JSON documents in a dataset
         dataset_name (str): JSON dataset name
         freq_paths_dict (dict): dictionary of paths and their frequencies
         prefix_paths_dict (dict): dictionary of paths and their prefixes
         prefix_freqs_dict (dict): dictionary of prefixes and their frequencies
-        prefix_nested_keys_freq_dict (dict): dictionary of paths and their nested keys frequencies
-        prefix_types_dict (dict): dictionary of paths' datatype and their prefixes 
 
     Returns:
         2d list: dataframe
@@ -95,19 +92,10 @@ def create_dataframe(num_docs, dataset_name, freq_paths_dict, prefix_paths_dict,
    
     for(prefix, p_list) in prefix_paths_dict.items(): 
         prefix_freqs_dict[prefix] = [freq_paths_dict[p] for p in p_list]
-
-    # Loop through the frequency path dictionary and record the frequency of each 
-    for (path, freq) in freq_paths_dict.items():
-        # Check if the delimiter is in a path
-        if len(path) > 1:
-            prefix = path[:-1]
-            prefix_nested_keys_freq_dict[prefix].append(freq)
     
     paths = list(freq_paths_dict.keys())
     df = pd.DataFrame({"Path": paths})
-    # Calculate the Jxplain entropy
-    df = is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs)
-    #df = populate_dataframe(num_docs, df, prefix_paths_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict, prefix_types_dict)
+    df = populate_dataframe(df, prefix_paths_dict, prefix_freqs_dict)
     
     df["Filename"] = dataset_name
     
@@ -143,7 +131,8 @@ def populate_dataframe(df, prefix_paths_dict, prefix_freqs_dict):
             
         df.at[key_loc, "Distinct_subkeys"] = list(distinct_subkeys)
 
-    
+    # Calculate the Jxplain entropy
+    #df = is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs)
     # Remove rows of keys that have no nested keys
     df = df[df.Distinct_subkeys.notnull()]
     df.dropna(inplace=True)
@@ -234,8 +223,7 @@ def initialize_dicts():
         defaultdict(lambda: 0),  # freq_paths_dict
         defaultdict(set),  # prefix_paths_dict
         defaultdict(set),  # prefix_types_dict
-        defaultdict(lambda: 0),  # prefix_freqs_dict
-        defaultdict(list)  #prefix_nested_keys_freq_dict
+        defaultdict(lambda: 0)  # prefix_freqs_dict
     )
 
 
@@ -252,18 +240,16 @@ def preprocess_data(files_folder):
             if not dynamic_paths:
                 continue
 
-        freq_paths_dict, prefix_paths_dict, prefix_types_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict = initialize_dicts()
-        num_docs = 0
+        freq_paths_dict, prefix_paths_dict, prefix_types_dict, prefix_freqs_dict = initialize_dicts()
 
         with open(os.path.join(files_folder, dataset), 'r') as file:
             #lines = islice(file, 10)
             for count, line in enumerate(file):
                 json_doc = json.loads(line)
                 process_document(json_doc, freq_paths_dict, prefix_paths_dict, prefix_types_dict)
-                num_docs += count
 
         #sys.stderr.write(f"Creating a dataframe for {dataset}\n")
-        df = create_dataframe(num_docs, dataset, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict, prefix_nested_keys_freq_dict, prefix_types_dict)
+        df = create_dataframe(dataset, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict)
             
         #sys.stderr.write(f"Labeling data for {dataset}\n")
         df = label_paths(dataset, df, dynamic_paths, keys_to_remove)
@@ -275,32 +261,7 @@ def preprocess_data(files_folder):
     return df
 
 
-
-    """
-    Input: Merged dataframe, writer object
-    Output: Classifier results and summary
-    Purpose: Perform ML classifier model to identify dynamic keys
-    """
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-    
-    #df[["Mean", "Range", "Standard_deviation", "Skewness", "Kurtosis", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]] = df[["Mean", "Range", "Standard_deviation", "Skewness", "Kurtosis", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]].astype(float)
-    #training_features = ["Percentage", "Nesting_level", "Mean", "Range", "Standard_deviation", "Skewness", "Kurtosis", "Mean_vectors", "Distinct_subkeys", "Distinct_subkeys_datatypes"]
-    #training_features = ["Datatype_entropy", "Key_entropy"]
-    training_features = df.columns.difference(["Path", "Filename", "Category"])
-
-    X = df.loc[:, training_features].values
-    y = df.Category
-    
-    random_value = 101
-   
-    # Perform classification using the best features/predictors
-    classify(X, y, df, training_features, writer, testing_size, random_value, use_logo=False)
-
-
 def is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs):
-    df["Datatype_entropy"] = np.nan
-    df["Key_entropy"] = np.nan
-
     # Calculate datatype entropy
     for (key, value) in prefix_types_dict.items():
         # Check if values of the nested keys of a set have the same datatype
@@ -344,7 +305,7 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        distinct_subkeys = self.data.iloc[idx]["Distinct_subkeys"]
+        distinct_subkeys = eval(self.data.iloc[idx]["Distinct_subkeys"])
         label = torch.tensor(self.data.iloc[idx]["Category"], dtype=torch.float32)
 
         # Tokenize each element in the list separately with dynamic max_length
@@ -395,7 +356,7 @@ def custom_codebert(df, test_size, random_value):
 
     # Start a new wandb run to track this script
     wandb.init(
-        project="custom-codebert_all_files " + str(num_epochs),
+        project="custom-codebert_all_files_" + str(num_epochs),
         config={
             "accumulation_steps": accumulation_steps,
             "batch_size": batch_size,
@@ -404,12 +365,6 @@ def custom_codebert(df, test_size, random_value):
             "learning_rate": learning_rate,
         }
     )
-    wandb.define_metric("accuracy", summary="max")
-    wandb.define_metric("precision", summary="max")
-    wandb.define_metric("recall", summary="max")
-    wandb.define_metric("F1", summary="max")
-    wandb.define_metric("training_loss", summary="min")
-    wandb.define_metric("testing_loss", summary="min")
 
     # Initialize tokenizer, model with adapter and classification head
     tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
@@ -429,6 +384,22 @@ def custom_codebert(df, test_size, random_value):
     train_df, test_df = split_data(df, test_size, random_value)
     train_dataset = CustomDataset(train_df, tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, tokenizer))
+
+    # Count static and dynamic keys
+    count_class_0 = len(train_df[train_df["Category"] == 0])
+    count_class_1 = len(train_df[train_df["Category"] == 1])
+
+    # Calculate total number of samples
+    total_samples = count_class_0 + count_class_1
+
+    # Calculate class weights
+    weight_for_class_0 = total_samples / (2 * count_class_0)
+    weight_for_class_1 = total_samples / (2 * count_class_1)
+    print("Class Weight for 0:", weight_for_class_0)
+    print("Class Weight for 1:", weight_for_class_1)
+
+    # Convert class weights to tensors
+    class_weights = torch.tensor([weight_for_class_0, weight_for_class_1]).to(device)
 
     # Set up scheduler to adjust the learning rate during training
     num_training_steps = num_epochs * len(train_dataloader)
@@ -452,9 +423,9 @@ def custom_codebert(df, test_size, random_value):
 
             # Forward pass
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            
+   
             # Modify the loss calculation
-            training_loss = loss_fn(outputs.logits[:, 0], labels)
+            training_loss = loss_fn(outputs.logits[:, 1], labels)
             training_loss.backward()
 
             if (i + 1) % accumulation_steps == 0:
@@ -490,10 +461,26 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
     test_dataset = CustomDataset(test_df, tokenizer)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, tokenizer))
 
+    # Count static and dynamic keys
+    count_class_0 = len(test_df[test_df["Category"] == 0])
+    count_class_1 = len(test_df[test_df["Category"] == 1])
+
+    # Calculate total number of samples
+    total_samples = count_class_0 + count_class_1
+
+    # Calculate class weights
+    weight_for_class_0 = total_samples / (2 * count_class_0)
+    weight_for_class_1 = total_samples / (2 * count_class_1)
+
+    # Convert class weights to tensors
+    class_weights = torch.tensor([weight_for_class_0, weight_for_class_1]).to(device)
+
+
     model.eval()
     total_loss = 0.0
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
+    true_labels_actuals = []
     true_labels_predictions = []
 
     with torch.no_grad():
@@ -502,7 +489,7 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
             with torch.no_grad():
                 outputs = model(**batch)
 
-            logits = outputs.logits[:, 0]
+            logits = outputs.logits[:, 1]
 
             # Calculate the testing loss
             testing_loss = loss_fn(logits, batch["label"])
@@ -510,18 +497,19 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
 
             # Get the actual and predicted labels
             actual_labels = batch["label"].cpu().numpy()
-            predictions = torch.round(torch.sigmoid(outputs.logits[:, 0]))
+            predictions = torch.round(torch.sigmoid(logits))
+            #print(predictions.cpu().numpy())
 
             # Collect both actual and predicted labels only for instances where actual label is 1
             true_labels_actuals.extend(actual_labels[actual_labels == 1].tolist())
             true_labels_predictions.extend(predictions[actual_labels == 1].cpu().numpy())
 
-
     average_loss = total_loss / len(test_loader)
 
     # Convert to PyTorch tensors
-    true_labels_actuals = torch.tensor(actual_labels)
+    true_labels_actuals = torch.tensor(true_labels_actuals)
     true_labels_predictions = torch.tensor(true_labels_predictions)
+
     
     accuracy = accuracy_score(true_labels_actuals, true_labels_predictions)
     precision = precision_score(true_labels_actuals, true_labels_predictions)
@@ -548,22 +536,13 @@ def save_model_and_adapter(model):
 
 
 def main():
-    dataset_folder, test_size = sys.argv[-2:]
-    df = preprocess_data(dataset_folder)
-    df = df.reset_index(drop = True)
-    '''
-    train_df, test_df = split_data(df, test_size, 101)
-    # Perform Jxplain1
-    y_pred = ((test_df["Datatype_entropy"] == 0) & (test_df["Key_entropy"] > 1)).astype(int)
-    print(len(y_pred), len(y_test))
-    # Calculate the precision, recall, f1-score, and support of dynamic keys
-    precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average = None, labels = [1])
-    '''
+    dataset_folder, testing_size = sys.argv[-2:]
+    #df = preprocess_data(dataset_folder)
+    #df = df.reset_index(drop = True)
     #df.to_csv("data.csv")
-    #df = pd.read_csv("data.csv")
-    custom_codebert(df, float(test_size), 101)
+    df = pd.read_csv("data.csv")
+    custom_codebert(df, float(testing_size), 101)
 
  
 if __name__ == '__main__':
     main()
-
