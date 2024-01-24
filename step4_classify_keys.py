@@ -178,7 +178,7 @@ def compare_tuples(tuple1, tuple2):
 
 
 def label_paths(dataset, df, dynamic_paths, keys_to_remove):
-    df["Category"] = 0
+    df["label"] = 0
 
     for key_path in dynamic_paths:
         key_path = ["$"] + key_path
@@ -190,7 +190,7 @@ def label_paths(dataset, df, dynamic_paths, keys_to_remove):
 
         for index, row in df.iterrows():
             if compare_tuples(row["Path"], key_path) and row["Filename"] == dataset:
-                df.at[index, "Category"] = 1
+                df.at[index, "label"] = 1
     return df
 
 
@@ -305,8 +305,9 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        distinct_subkeys = eval(self.data.iloc[idx]["Distinct_subkeys"])
-        label = torch.tensor(self.data.iloc[idx]["Category"], dtype=torch.float32)
+        #distinct_subkeys = eval(self.data.iloc[idx]["Distinct_subkeys"])
+        distinct_subkeys = self.data.iloc[idx]["Distinct_subkeys"]
+        label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
 
         # Tokenize each element in the list separately with dynamic max_length
         tokenized_distinct_subkeys = self.tokenizer(
@@ -348,7 +349,28 @@ def collate_fn(batch, tokenizer):
         "label": labels
     }
 
-def custom_codebert(df, test_size, random_value):
+
+def split_data(df, test_size, random_value):
+    # Split the data into training and testing sets based on filenames
+    filenames = df["Filename"].tolist()
+    train_filenames, test_filenames = train_test_split(filenames, test_size=test_size, random_state=random_value)
+    train_df = df[df["Filename"].isin(train_filenames)]
+    test_df = df[df["Filename"].isin(test_filenames)]
+    return train_df, test_df
+
+
+def initialize_model(adapter_name="mrpc"):
+    model_name = "microsoft/codebert-base"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoAdapterModel.from_pretrained(model_name)
+    model.add_classification_head(adapter_name, num_labels=2)
+    model.add_adapter(adapter_name, config="seq_bn")
+    model.set_active_adapters(adapter_name)
+    wandb.watch(model)
+    return model, tokenizer
+   
+
+def train_model(df, test_size, random_value):
     accumulation_steps = 4
     batch_size = 8
     learning_rate = 5e-5
@@ -365,14 +387,9 @@ def custom_codebert(df, test_size, random_value):
             "learning_rate": learning_rate,
         }
     )
-
+    
     # Initialize tokenizer, model with adapter and classification head
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-    model = AutoAdapterModel.from_pretrained("microsoft/codebert-base")
-    model.add_classification_head("mrpc", num_labels=2)
-    model.add_adapter("mrpc", config="seq_bn")
-    model.set_active_adapters("mrpc")
-    wandb.watch(model)
+    model, tokenizer = initialize_model()
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -385,22 +402,6 @@ def custom_codebert(df, test_size, random_value):
     train_dataset = CustomDataset(train_df, tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, tokenizer))
 
-    # Count static and dynamic keys
-    count_class_0 = len(train_df[train_df["Category"] == 0])
-    count_class_1 = len(train_df[train_df["Category"] == 1])
-
-    # Calculate total number of samples
-    total_samples = count_class_0 + count_class_1
-
-    # Calculate class weights
-    weight_for_class_0 = total_samples / (2 * count_class_0)
-    weight_for_class_1 = total_samples / (2 * count_class_1)
-    print("Class Weight for 0:", weight_for_class_0)
-    print("Class Weight for 1:", weight_for_class_1)
-
-    # Convert class weights to tensors
-    class_weights = torch.tensor([weight_for_class_0, weight_for_class_1]).to(device)
-
     # Set up scheduler to adjust the learning rate during training
     num_training_steps = num_epochs * len(train_dataloader)
     lr_scheduler = get_scheduler(
@@ -411,7 +412,9 @@ def custom_codebert(df, test_size, random_value):
     )
 
     early_stopper = EarlyStopper(patience=5, min_delta=10)
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    #loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss_fn = torch.nn.CrossEntropyLoss()
+
 
     # Train the model
     model.train()
@@ -420,14 +423,13 @@ def custom_codebert(df, test_size, random_value):
         total_loss = 0
         for i, batch in enumerate(tqdm.tqdm(train_dataloader, position=1, leave=False, total=len(train_dataloader))):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-
             # Forward pass
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-   
-            # Modify the loss calculation
-            training_loss = loss_fn(outputs.logits[:, 1], labels)
+        
+            # Calculate the training loss
+            training_loss = loss_fn(outputs.logits, labels)
             training_loss.backward()
-
+            
             if (i + 1) % accumulation_steps == 0:
                 optimizer.step()
                 lr_scheduler.step()
@@ -435,89 +437,76 @@ def custom_codebert(df, test_size, random_value):
 
             total_loss += training_loss.item()
             torch.cuda.empty_cache()
-
+        
         average_loss = total_loss / len(train_dataloader)
         wandb.log({"training_loss": average_loss})
 
         # Evaluate the model
-        testing_loss = evaluate_data(test_df, tokenizer, batch_size, model, device, wandb)
+        testing_loss = evaluate_data(test_df, tokenizer, batch_size, model, device, wandb, loss_fn)
 
         if early_stopper.early_stop(testing_loss):
             save_model_and_adapter(model)
             break
-
+        
     # Save the adapter
     model.save_adapter("./adapter", "mrpc", with_head=True)
     
-def split_data(df, test_size, random_value):
-    # Split the data into training and testing sets based on filenames
-    filenames = df["Filename"].tolist()
-    train_filenames, test_filenames = train_test_split(filenames, test_size=test_size, random_state=random_value)
-    train_df = df[df["Filename"].isin(train_filenames)]
-    test_df = df[df["Filename"].isin(test_filenames)]
-    return train_df, test_df
 
-def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
+def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb, loss_fn):
     test_dataset = CustomDataset(test_df, tokenizer)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, tokenizer))
 
-    # Count static and dynamic keys
-    count_class_0 = len(test_df[test_df["Category"] == 0])
-    count_class_1 = len(test_df[test_df["Category"] == 1])
-
-    # Calculate total number of samples
-    total_samples = count_class_0 + count_class_1
-
-    # Calculate class weights
-    weight_for_class_0 = total_samples / (2 * count_class_0)
-    weight_for_class_1 = total_samples / (2 * count_class_1)
-
-    # Convert class weights to tensors
-    class_weights = torch.tensor([weight_for_class_0, weight_for_class_1]).to(device)
-
-
     model.eval()
     total_loss = 0.0
-    loss_fn = torch.nn.BCEWithLogitsLoss()
 
-    true_labels_actuals = []
-    true_labels_predictions = []
+    total_actual_labels = []
+    total_predicted_labels = []
 
     with torch.no_grad():
         for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                outputs = model(**batch)
+            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
+            # Forward pass
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-            logits = outputs.logits[:, 1]
+            # Get the probabilities
+            logits = outputs.logits
 
             # Calculate the testing loss
-            testing_loss = loss_fn(logits, batch["label"])
+            testing_loss = loss_fn(logits, labels)
             total_loss += testing_loss.item()
 
             # Get the actual and predicted labels
-            actual_labels = batch["label"].cpu().numpy()
-            predictions = torch.round(torch.sigmoid(logits))
-            #print(predictions.cpu().numpy())
-
-            # Collect both actual and predicted labels only for instances where actual label is 1
-            true_labels_actuals.extend(actual_labels[actual_labels == 1].tolist())
-            true_labels_predictions.extend(predictions[actual_labels == 1].cpu().numpy())
+            actual_labels = labels.cpu().numpy()
+            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
+            total_actual_labels.extend(actual_labels)
+            total_predicted_labels.extend(predicted_labels)
 
     average_loss = total_loss / len(test_loader)
 
-    # Convert to PyTorch tensors
-    true_labels_actuals = torch.tensor(true_labels_actuals)
-    true_labels_predictions = torch.tensor(true_labels_predictions)
-
+    # Calculate the accuracy, precision, recall, f1 score of the positive class
+    true_labels_positive, predicted_labels_positive = filter_labels(total_actual_labels, total_predicted_labels)
+    accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
+    precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
     
-    accuracy = accuracy_score(true_labels_actuals, true_labels_predictions)
-    precision = precision_score(true_labels_actuals, true_labels_predictions)
-    recall = recall_score(true_labels_actuals, true_labels_predictions)
-    f1 = f1_score(true_labels_actuals, true_labels_predictions)
+    print(f'accuracy: {accuracy}, precision: {precision}, recall: {recall}, F1: {f1}')
+    wandb.log({"accuracy": accuracy, "testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1})
 
-    wandb.log({"testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1, "accuracy": accuracy})
     return average_loss
+
+def filter_labels(true_labels, predicted_labels):
+    # Get indices where true labels are 1
+    positive_indices = [i for i, label in enumerate(true_labels) if label == 1]
+
+    # Filter true labels for positive class
+    true_labels_positive = [true_labels[i] for i in positive_indices]
+
+    # Filter predicted labels for positive class
+    predicted_labels_positive = [predicted_labels[i] for i in positive_indices]
+
+    return true_labels_positive, predicted_labels_positive
+
 
 def save_model_and_adapter(model):
     # Save the entire model
@@ -537,11 +526,13 @@ def save_model_and_adapter(model):
 
 def main():
     dataset_folder, testing_size = sys.argv[-2:]
-    #df = preprocess_data(dataset_folder)
-    #df = df.reset_index(drop = True)
+    df = preprocess_data(dataset_folder)
+    df = df.reset_index(drop = True)
+    #print(df)
     #df.to_csv("data.csv")
-    df = pd.read_csv("data.csv")
-    custom_codebert(df, float(testing_size), 101)
+    #df = pd.read_csv("data.csv")
+
+    train_model(df, float(testing_size), 101)
 
  
 if __name__ == '__main__':
