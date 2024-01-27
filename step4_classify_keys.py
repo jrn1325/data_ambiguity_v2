@@ -13,7 +13,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.model_selection import train_test_split
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, AutoTokenizer, get_scheduler
+from transformers import AdamW, AutoTokenizer,  AutoModelWithLMHead, get_scheduler
 
 import torch
 import torch.nn.functional as F
@@ -359,10 +359,10 @@ def split_data(df, test_size, random_value):
     return train_df, test_df
 
 
-def initialize_model(adapter_name="mrpc"):
-    model_name = "microsoft/codebert-base"
+def initialize_model(model_name, adapter_name="mrpc"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoAdapterModel.from_pretrained(model_name)
+    #model = AutoModelWithLMHead.from_pretrained(model_name, num_labels=2)
     model.add_classification_head(adapter_name, num_labels=2)
     model.add_adapter(adapter_name, config="seq_bn")
     model.set_active_adapters(adapter_name)
@@ -371,10 +371,12 @@ def initialize_model(adapter_name="mrpc"):
    
 
 def train_model(df, test_size, random_value):
+    model_name = "microsoft/codebert-base"
+    #model_name = "codeparrot/codeparrot-small"
     accumulation_steps = 4
-    batch_size = 8
-    learning_rate = 5e-5
-    num_epochs = 25
+    batch_size = 16
+    learning_rate = 2e-5
+    num_epochs = 50
 
     # Start a new wandb run to track this script
     wandb.init(
@@ -385,11 +387,12 @@ def train_model(df, test_size, random_value):
             "dataset": "json-schemas",
             "epochs": num_epochs,
             "learning_rate": learning_rate,
+            "model_name": model_name,
         }
     )
-    
+
     # Initialize tokenizer, model with adapter and classification head
-    model, tokenizer = initialize_model()
+    model, tokenizer = initialize_model(model_name)
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -404,16 +407,15 @@ def train_model(df, test_size, random_value):
 
     # Set up scheduler to adjust the learning rate during training
     num_training_steps = num_epochs * len(train_dataloader)
+    num_warmup_steps = int(0.1 * num_training_steps)
     lr_scheduler = get_scheduler(
         "linear",
         optimizer=optimizer,
-        num_warmup_steps=0,
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps,
     )
 
-    early_stopper = EarlyStopper(patience=5, min_delta=10)
-    #loss_fn = torch.nn.BCEWithLogitsLoss()
-    loss_fn = torch.nn.CrossEntropyLoss()
+    early_stopper = EarlyStopper(patience=5, min_delta=0.005)
 
 
     # Train the model
@@ -424,10 +426,10 @@ def train_model(df, test_size, random_value):
         for i, batch in enumerate(tqdm.tqdm(train_dataloader, position=1, leave=False, total=len(train_dataloader))):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
             # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+  
             # Calculate the training loss
-            training_loss = loss_fn(outputs.logits, labels)
+            training_loss = outputs.loss
             training_loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
@@ -442,17 +444,17 @@ def train_model(df, test_size, random_value):
         wandb.log({"training_loss": average_loss})
 
         # Evaluate the model
-        testing_loss = evaluate_data(test_df, tokenizer, batch_size, model, device, wandb, loss_fn)
+        testing_loss = evaluate_data(test_df, tokenizer, batch_size, model, device, wandb)
 
         if early_stopper.early_stop(testing_loss):
-            save_model_and_adapter(model)
             break
         
     # Save the adapter
-    model.save_adapter("./adapter", "mrpc", with_head=True)
+    save_model_and_adapter(model)
+    wandb.save("./adapter/*")
     
 
-def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb, loss_fn):
+def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
     test_dataset = CustomDataset(test_df, tokenizer)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, tokenizer))
 
@@ -466,13 +468,13 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb, loss_fn)
         for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
             # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
             # Get the probabilities
             logits = outputs.logits
 
             # Calculate the testing loss
-            testing_loss = loss_fn(logits, labels)
+            testing_loss = outputs.loss
             total_loss += testing_loss.item()
 
             # Get the actual and predicted labels
@@ -528,10 +530,8 @@ def main():
     dataset_folder, testing_size = sys.argv[-2:]
     df = preprocess_data(dataset_folder)
     df = df.reset_index(drop = True)
-    #print(df)
     #df.to_csv("data.csv")
     #df = pd.read_csv("data.csv")
-
     train_model(df, float(testing_size), 101)
 
  
