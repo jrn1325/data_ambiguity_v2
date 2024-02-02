@@ -276,7 +276,6 @@ def is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, 
         df.loc[df.Path == key, "Key_entropy"] = -key_entropy
     return df
 
-
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
     def __init__(self, patience=1, min_delta=0):
@@ -349,6 +348,14 @@ def collate_fn(batch, tokenizer):
         "label": labels
     }
 
+def initialize_model(model_name, adapter_name="mrpc"):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoAdapterModel.from_pretrained(model_name)
+    model.add_classification_head(adapter_name, num_labels=2)
+    model.add_adapter(adapter_name, config="seq_bn")
+    model.set_active_adapters(adapter_name)
+    wandb.watch(model)
+    return model, tokenizer
 
 def split_data(df, test_size, random_value):
     # Split the data into training and testing sets based on filenames
@@ -357,26 +364,14 @@ def split_data(df, test_size, random_value):
     train_df = df[df["Filename"].isin(train_filenames)]
     test_df = df[df["Filename"].isin(test_filenames)]
     return train_df, test_df
-
-
-def initialize_model(model_name, adapter_name="mrpc"):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoAdapterModel.from_pretrained(model_name)
-    #model = AutoModelWithLMHead.from_pretrained(model_name, num_labels=2)
-    model.add_classification_head(adapter_name, num_labels=2)
-    model.add_adapter(adapter_name, config="seq_bn")
-    model.set_active_adapters(adapter_name)
-    wandb.watch(model)
-    return model, tokenizer
    
-
 def train_model(df, test_size, random_value):
     model_name = "microsoft/codebert-base"
     #model_name = "codeparrot/codeparrot-small"
     accumulation_steps = 4
     batch_size = 16
     learning_rate = 2e-5
-    num_epochs = 50
+    num_epochs = 25
 
     # Start a new wandb run to track this script
     wandb.init(
@@ -453,7 +448,6 @@ def train_model(df, test_size, random_value):
     save_model_and_adapter(model)
     wandb.save("./adapter/*")
     
-
 def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
     test_dataset = CustomDataset(test_df, tokenizer)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, tokenizer))
@@ -508,7 +502,6 @@ def filter_labels(true_labels, predicted_labels):
     predicted_labels_positive = [predicted_labels[i] for i in positive_indices]
 
     return true_labels_positive, predicted_labels_positive
-
 
 def save_model_and_adapter(model):
     # Save the entire model
