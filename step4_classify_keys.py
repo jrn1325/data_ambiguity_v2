@@ -83,10 +83,10 @@ def process_document(doc, prefix_paths_dict, path_types_dict):
 
 def create_dataframe(prefix_paths_dict, dataset):
     """
-    Create a DataFrame from dictionaries containing path types and path frequencies.
+    Create a DataFrame from dictionaries containing path types and path prefixes.
 
     Args:
-        path_types_dict (dict): A dictionary where keys are paths (tuples) and values are sets of types.
+        prefix_paths_dict (dict): A dictionary where keys are path prefixes and values are sets of paths.
         dataset (str): The name of the dataset.
 
     Returns:
@@ -94,7 +94,7 @@ def create_dataframe(prefix_paths_dict, dataset):
     """
     data = []
 
-    # Calculate the number of distinct subkeys under each parent key
+    # Get the distinct subkeys under each path
     for path, subpaths in prefix_paths_dict.items():
         distinct_subkeys = {k[-1] for k in subpaths}
         
@@ -116,6 +116,17 @@ def create_dataframe(prefix_paths_dict, dataset):
 
 
 def compare_tuples(tuple1, tuple2):
+    """
+    Compare two tuples element-wise, allowing for regular expression matching on elements in tuple2.
+
+    Args:
+        tuple1 (tuple): The first tuple, typically containing actual values.
+        tuple2 (tuple): The second tuple, which may contain regex patterns as strings.
+
+    Returns:
+        bool: True if tuples are considered equal, False otherwise.
+    """
+
     if len(tuple1) != len(tuple2):
         return False
 
@@ -128,6 +139,17 @@ def compare_tuples(tuple1, tuple2):
 
 
 def label_paths(dataset, df, dynamic_paths):
+    """
+    Label rows in the DataFrame as 1 if their 'path' matches any of the dynamic paths.
+
+    Args:
+        dataset (str): The dataset name to compare with.
+        df (pd.DataFrame): The DataFrame containing 'path' and 'filename' columns.
+        dynamic_paths (list): A list of dynamic paths to compare against.
+
+    Returns:
+        pd.DataFrame: The input DataFrame with an additional 'label' column, where 1 indicates a match with dynamic paths.
+    """
     df["label"] = 0
 
     for key_path in dynamic_paths:
@@ -551,11 +573,15 @@ def main():
     dataset_folder, test_size, mode = sys.argv[-3:]
     df = preprocess_data(dataset_folder)
     train_df, test_df = split_data(df, float(test_size))
+
    
     if mode == "train":
         train_model(train_df, test_df)
     elif mode == "test":
         evaluate_model(test_df)
+    else:
+        print("Invalid mode. Please specify 'train' or 'test'.")
+        sys.exit(1)
     
  
 if __name__ == "__main__":
