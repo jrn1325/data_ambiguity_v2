@@ -27,7 +27,6 @@ RANDOM_VALUE = 101
 BATCH_SIZE = 64
 ADAPTER_NAME = "data_ambiguity"
 MODEL_NAME = "microsoft/codebert-base"
-STATE_DICT_PATH = "./state_dict"
 PATH = "./adapter-model"
 
 
@@ -518,7 +517,7 @@ def save_model_and_adapter(model):
     Args:
         model: The model with the adapter to save.
     """
-    #torch.save(model.state_dict(), STATE_DICT_PATH)
+
     path = os.path.join(os.getcwd(), "adapter-model")
     
     # Save the entire model
