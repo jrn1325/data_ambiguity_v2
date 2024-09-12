@@ -1,37 +1,43 @@
 import json
-import math
 import numpy as np
 import os
 import pandas as pd
 import re
 import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import tqdm
+import wandb
 
 from adapters import AutoAdapterModel
 from collections import defaultdict
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, AutoTokenizer,  AutoModelWithLMHead, get_scheduler
+from transformers import AdamW, AutoTokenizer, get_scheduler
 
-import torch
-import torch.nn.functional as F
-import wandb
 import warnings
 warnings.filterwarnings("ignore")
 
 # Create constant variables
+KEYS_TO_REMOVE = ["definitions", "$defs", "properties", "patternProperties", "oneOf", "allOf", "anyOf", "items"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
+RANDOM_VALUE = 101
+BATCH_SIZE = 64
+ADAPTER_NAME = "data_ambiguity"
+MODEL_NAME = "microsoft/codebert-base"
+STATE_DICT_PATH = "./state_dict"
+PATH = "./adapter-model"
 
-def extract_paths(doc, paths = [], types = [], num_nested_keys = []):
+
+def extract_paths(doc, path = ('$',), values = []):
     """Get the path of each key and its value from the json documents
 
     Args:
         doc (dict): JSON document
-        paths (list, optional): list of keys full path. Defaults to [].
-        types (list, optional): list of keys' datatypes. Defaults to [].
-        num_nested_keys (list, optional): number of paths nested keys. Defaults to [].
+        path (tuple, optional): list of keys full path. Defaults to ('$',).
+        values (list, optional): list of keys' values. Defaults to [].
 
     Raises:
         ValueError: Returns an error if the json object is not a dict or list
@@ -44,125 +50,70 @@ def extract_paths(doc, paths = [], types = [], num_nested_keys = []):
     elif isinstance(doc, list):
         if len(doc) > 0:
             #iterator = [('*', doc[0])]
-            iterator = []
+            iterator = [] # We will handle lists later
         else:
             iterator = []
     else:
         raise ValueError('Invalid type')
   
-    for (key, value) in iterator:
-        yield paths + [key], value, len(value) if isinstance(value, (dict, list))  else 0
+    for key, value in iterator:
+        yield path + (key,), value
         if isinstance(value, (dict, list)):
-            yield from extract_paths(value, paths + [key], types, num_nested_keys)
+            yield from extract_paths(value, path + (key,), values)
     
 
-def process_document(doc, freq_paths_dict, prefix_paths_dict, prefix_types_dict): 
-    """Extract information from each JSON document
+def process_document(doc, prefix_paths_dict, path_types_dict): 
+    """
+    Extracts paths from the given JSON document and stores them in a dictionary,
+    grouping paths that share the same prefix.
 
     Args:
-        doc (dict): JSON document
-        freq_paths_dict (dict): stores all paths and their frequencies
-        prefix_paths_dict (dict): stores paths with same prefixes
-        prefix_types_dict (dict): stores paths' values datatypes
+        doc (dict): The JSON document from which paths are extracted.
+        prefix_paths_dict (dict): A dictionary where the keys are path prefixes 
+                                  (tuples of path segments, excluding the last segment),
+                                  and the values are sets of full paths that share the same prefix.
+        path_types_dict, p): (dict): A dictionary where the keys are path prefixes and the values are lists of types of the nested keys.
     """
-    new_obj = {"$": doc}
-    for (path, value, nested_keys_count) in extract_paths(new_obj):
-        path = tuple(path)
-        freq_paths_dict[path] += 1
-        
+    
+    for path, value in extract_paths(doc):
         if len(path) > 1:
             prefix = path[:-1]
             prefix_paths_dict[prefix].add(path)
-            
-        prefix_types_dict[path].add(type(value).__name__)
-              
+        path_types_dict[path].add(type(value).__name__)
 
-def create_dataframe(dataset_name, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict):
-    """Create a dataframe
+
+def create_dataframe(prefix_paths_dict, dataset):
+    """
+    Create a DataFrame from dictionaries containing path types and path frequencies.
 
     Args:
-        dataset_name (str): JSON dataset name
-        freq_paths_dict (dict): dictionary of paths and their frequencies
-        prefix_paths_dict (dict): dictionary of paths and their prefixes
-        prefix_freqs_dict (dict): dictionary of prefixes and their frequencies
+        path_types_dict (dict): A dictionary where keys are paths (tuples) and values are sets of types.
+        dataset (str): The name of the dataset.
 
     Returns:
-        2d list: dataframe
+        pd.DataFrame: A DataFrame with 'path', 'distinct_subkeys', and 'filename' columns.
     """
-   
-    for(prefix, p_list) in prefix_paths_dict.items(): 
-        prefix_freqs_dict[prefix] = [freq_paths_dict[p] for p in p_list]
-    
-    paths = list(freq_paths_dict.keys())
-    df = pd.DataFrame({"Path": paths})
-    df = populate_dataframe(df, prefix_paths_dict, prefix_freqs_dict)
-    
-    df["Filename"] = dataset_name
-    
-    return df
+    data = []
 
-
-def populate_dataframe(df, prefix_paths_dict, prefix_freqs_dict):
-    """Create a dataframe of all the features
-
-    Args:
-        df (2d list): dataframe with JSON paths
-        prefix_paths_dict (dict): dictionary of paths and their prefixes
-        prefix_freqs_dict (dict): dictionary of paths and their frequencies
-
-    Returns:
-        2d list: dataframe
-    """
-    
-    # Create a new column for distinct subkeys
-    df["Distinct_subkeys"] = None
-
-    # Calculate complex descriptive statistics
-    for path in prefix_freqs_dict.keys():
-        # Get the location of the key within the dataframe
-        key_loc = df.loc[df.Path == path].index[0]
-
-        # Get the number of unique subkeys under a parent key
-        distinct_subkeys = set()
-        for k in prefix_paths_dict[path]:
-            distinct_subkeys.add(k[-1])
-            if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
-                break
-            
-        df.at[key_loc, "Distinct_subkeys"] = list(distinct_subkeys)
-
-    # Calculate the Jxplain entropy
-    #df = is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs)
-    # Remove rows of keys that have no nested keys
-    df = df[df.Distinct_subkeys.notnull()]
-    df.dropna(inplace=True)
-    return df
-
-
-def find_dynamic_paths(obj, path=""):
-    """Use the schemas associated with the JSON datasets to find the labels
-
-    Args:
-        obj (dict, list): JSON object
-        path (str, optional): path of JSON object. Defaults to "".
-
-    Yields:
-        tuple: path of key
-    """
-    if isinstance(obj, dict):
-        if "properties" in obj and "patternProperties" in obj:
-            pass
-        elif "properties" in obj:
-            for (k, v) in obj["properties"].items():
-                yield from find_dynamic_paths(v, path + "." + k)
-        elif "patternProperties" in obj:
-            if len(obj["patternProperties"]) == 1:
-                yield path
-                yield from find_dynamic_paths(next(iter(obj["patternProperties"].values())), path + ".*")
+    # Calculate the number of distinct subkeys under each parent key
+    for path, subpaths in prefix_paths_dict.items():
+        distinct_subkeys = {k[-1] for k in subpaths}
         
-    elif isinstance(obj, list):
-        for (i, v) in enumerate(obj):
-            yield from find_dynamic_paths(v, path + "[" + str(i) + "]")
+        # Limit the number of distinct subkeys collected to the upper bound
+        if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
+            distinct_subkeys = set(list(distinct_subkeys)[:DISTINCT_SUBKEYS_UPPER_BOUND])
+
+        # Append the path and the distinct subkeys to the data list
+        data.append({
+            "path": path,
+            "distinct_subkeys": json.dumps(list(distinct_subkeys))
+        })
+    
+    # Create the DataFrame from the data list
+    df = pd.DataFrame(data)
+    df["filename"] = dataset
+    
+    return df
 
 
 def compare_tuples(tuple1, tuple2):
@@ -177,29 +128,26 @@ def compare_tuples(tuple1, tuple2):
     return True
 
 
-def label_paths(dataset, df, dynamic_paths, keys_to_remove):
+def label_paths(dataset, df, dynamic_paths):
     df["label"] = 0
 
     for key_path in dynamic_paths:
-        key_path = ["$"] + key_path
         if "items" in key_path:
             continue
-        #print(key_path)
-        key_path = tuple([i for i in key_path if i not in keys_to_remove])
-        #print(key_path)
+        key_path = tuple([i for i in key_path if i not in KEYS_TO_REMOVE])
 
         for index, row in df.iterrows():
-            if compare_tuples(row["Path"], key_path) and row["Filename"] == dataset:
+            if compare_tuples(row["path"], key_path) and row["filename"] == dataset:
                 df.at[index, "label"] = 1
     return df
 
 
-def extract_pattern_properties_parents(schema, path=[]):
+def extract_pattern_properties_parents(schema, path = ('$',)):
     """Get the keys under "patternProperties" in JSON schemas
 
     Args:
         schema (dict): JSON schema
-        path (list, optional): path to key. Defaults to [].
+        path (tuple, optional): path to key. Defaults to ().
 
     Yields:
         tuple: key path
@@ -211,25 +159,15 @@ def extract_pattern_properties_parents(schema, path=[]):
             yield path
 
         for key, value in schema.items():
-            yield from extract_pattern_properties_parents(value, path + [key])
+            yield from extract_pattern_properties_parents(value, path + (key,))
                 
     elif isinstance(schema, list):
         for index, item in enumerate(schema):
             yield from extract_pattern_properties_parents(item, path)
 
 
-def initialize_dicts():
-    return (
-        defaultdict(lambda: 0),  # freq_paths_dict
-        defaultdict(set),  # prefix_paths_dict
-        defaultdict(set),  # prefix_types_dict
-        defaultdict(lambda: 0)  # prefix_freqs_dict
-    )
-
-
 def preprocess_data(files_folder):
     frames = []
-    keys_to_remove = ["definitions", "$defs", "properties", "patternProperties", "oneOf", "allOf", "anyOf", "items"]
 
     datasets = os.listdir(files_folder)
     for dataset in tqdm.tqdm(datasets):
@@ -239,42 +177,29 @@ def preprocess_data(files_folder):
             dynamic_paths = list(extract_pattern_properties_parents(json_schema))
             if not dynamic_paths:
                 continue
-
-        freq_paths_dict, prefix_paths_dict, prefix_types_dict, prefix_freqs_dict = initialize_dicts()
+        prefix_paths_dict = defaultdict(set)
+        path_types_dict = defaultdict(set)
+    
 
         with open(os.path.join(files_folder, dataset), 'r') as file:
-            #lines = islice(file, 10)
             for count, line in enumerate(file):
-                json_doc = json.loads(line)
-                process_document(json_doc, freq_paths_dict, prefix_paths_dict, prefix_types_dict)
+                doc = json.loads(line)
+                process_document(doc, prefix_paths_dict, path_types_dict)
 
         #sys.stderr.write(f"Creating a dataframe for {dataset}\n")
-        df = create_dataframe(dataset, freq_paths_dict, prefix_paths_dict, prefix_freqs_dict)
+        df = create_dataframe(prefix_paths_dict, dataset)
             
         #sys.stderr.write(f"Labeling data for {dataset}\n")
-        df = label_paths(dataset, df, dynamic_paths, keys_to_remove)
+        df = label_paths(dataset, df, dynamic_paths)
         frames.append(df)
 
     sys.stderr.write('Merging dataframes...\n')
     df = pd.concat(frames, ignore_index = True)
+    df = df.reset_index(drop = True)
     
     return df
 
 
-def is_tuple_or_collection(df, prefix_types_dict, prefix_nested_keys_freq_dict, num_docs):
-    # Calculate datatype entropy
-    for (key, value) in prefix_types_dict.items():
-        # Check if values of the nested keys of a set have the same datatype
-        #result = all(isinstance(nested_key, type(value[0])) for nested_key in value[1:])
-        df.loc[df.Path == key, "Datatype_entropy"] = 0 if all(value) else 1
-            
-    # Calculate key entropy and add as a new column
-    for (key, value) in prefix_nested_keys_freq_dict.items():
-        key_entropy = 0
-        for freq in value:
-            key_entropy += (freq/num_docs) * math.log(freq/num_docs)
-        df.loc[df.Path == key, "Key_entropy"] = -key_entropy
-    return df
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
@@ -295,7 +220,7 @@ class EarlyStopper:
         return False
 
 class CustomDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, max_length=1000):
+    def __init__(self, dataframe, tokenizer, max_length=512):
         self.data = dataframe
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -304,72 +229,58 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        #distinct_subkeys = eval(self.data.iloc[idx]["Distinct_subkeys"])
-        distinct_subkeys = self.data.iloc[idx]["Distinct_subkeys"]
+        distinct_subkeys = self.data.iloc[idx]["distinct_subkeys"]
         label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
 
-        # Tokenize each element in the list separately with dynamic max_length
         tokenized_distinct_subkeys = self.tokenizer(
             distinct_subkeys,
             truncation=True,
-            padding=True,
+            padding="max_length",
             return_tensors="pt",
             max_length=self.max_length
         )
 
         return {
-            "input_ids": tokenized_distinct_subkeys["input_ids"],
-            "attention_mask": tokenized_distinct_subkeys["attention_mask"],
+            "input_ids": tokenized_distinct_subkeys["input_ids"].squeeze(0),
+            "attention_mask": tokenized_distinct_subkeys["attention_mask"].squeeze(0),
             "label": label
         }
 
-def collate_fn(batch, tokenizer):
-    # Get maximum sequence length in the batch
-    max_len = max(len(item["input_ids"][0]) for item in batch)
-
-    # Pad all values to the maximum length in the batch
-    input_ids_padded = pad_sequence(
-        [F.pad(item["input_ids"][0], pad=(0, max_len - len(item["input_ids"][0])), value=tokenizer.pad_token_id) for item in batch],
-        batch_first=True,
-        padding_value=tokenizer.pad_token_id
-    )
-    
-    attention_mask_padded = pad_sequence(
-        [F.pad(item["attention_mask"][0], pad=(0, max_len - len(item["attention_mask"][0])), value=0) for item in batch],
-        batch_first=True,
-        padding_value=0
-    )
-
+def collate_fn(batch):
+    input_ids = torch.stack([item["input_ids"] for item in batch])
+    attention_mask = torch.stack([item["attention_mask"] for item in batch])
     labels = torch.stack([item["label"] for item in batch])
 
     return {
-        "input_ids": input_ids_padded,
-        "attention_mask": attention_mask_padded,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
         "label": labels
     }
 
-def initialize_model(model_name, adapter_name="mrpc"):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoAdapterModel.from_pretrained(model_name)
-    model.add_classification_head(adapter_name, num_labels=2)
-    model.add_adapter(adapter_name, config="seq_bn")
-    model.set_active_adapters(adapter_name)
+
+def initialize_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
+    model.add_classification_head(ADAPTER_NAME, num_labels=2)
+    model.add_adapter(ADAPTER_NAME, config="seq_bn")
+    model.set_active_adapters(ADAPTER_NAME)
+    model.train_adapter(ADAPTER_NAME)
     wandb.watch(model)
     return model, tokenizer
 
-def split_data(df, test_size, random_value):
+
+def split_data(df, test_size):
     # Split the data into training and testing sets based on filenames
-    filenames = df["Filename"].tolist()
-    train_filenames, test_filenames = train_test_split(filenames, test_size=test_size, random_state=random_value)
-    train_df = df[df["Filename"].isin(train_filenames)]
-    test_df = df[df["Filename"].isin(test_filenames)]
+    filenames = df["filename"].tolist()
+    train_filenames, test_filenames = train_test_split(filenames, test_size=test_size, random_state=RANDOM_VALUE)
+    train_df = df[df["filename"].isin(train_filenames)]
+    test_df = df[df["filename"].isin(test_filenames)]
     return train_df, test_df
    
-def train_model(df, test_size, random_value):
-    model_name = "microsoft/codebert-base"
-    #model_name = "codeparrot/codeparrot-small"
+
+def train_model(train_df, test_df):
+
     accumulation_steps = 4
-    batch_size = 16
     learning_rate = 2e-5
     num_epochs = 25
 
@@ -378,27 +289,31 @@ def train_model(df, test_size, random_value):
         project="custom-codebert_all_files_" + str(num_epochs),
         config={
             "accumulation_steps": accumulation_steps,
-            "batch_size": batch_size,
+            "batch_size": BATCH_SIZE,
             "dataset": "json-schemas",
             "epochs": num_epochs,
             "learning_rate": learning_rate,
-            "model_name": model_name,
+            "model_name": MODEL_NAME,
         }
     )
 
     # Initialize tokenizer, model with adapter and classification head
-    model, tokenizer = initialize_model(model_name)
+    model, tokenizer = initialize_model()
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+    # Use all available GPUs
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    train_df, test_df = split_data(df, test_size, random_value)
     train_dataset = CustomDataset(train_df, tokenizer)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x, tokenizer))
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: collate_fn(x))
 
     # Set up scheduler to adjust the learning rate during training
     num_training_steps = num_epochs * len(train_dataloader)
@@ -425,32 +340,40 @@ def train_model(df, test_size, random_value):
   
             # Calculate the training loss
             training_loss = outputs.loss
+
+            # Need to average the loss if we are using DataParallel
+            if training_loss.dim() > 0:
+                training_loss = training_loss.mean()
+
             training_loss.backward()
             
-            if (i + 1) % accumulation_steps == 0:
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_dataloader):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+        
 
             total_loss += training_loss.item()
-            torch.cuda.empty_cache()
         
         average_loss = total_loss / len(train_dataloader)
         wandb.log({"training_loss": average_loss})
 
-        # Evaluate the model
-        testing_loss = evaluate_data(test_df, tokenizer, batch_size, model, device, wandb)
+        # Test the model
+        testing_loss = test_model(test_df, tokenizer, model, device, wandb)
 
         if early_stopper.early_stop(testing_loss):
+            print(f"Early stopping at epoch {epoch + 1}")
             break
         
     # Save the adapter
     save_model_and_adapter(model)
-    wandb.save("./adapter/*")
+
+    wandb.save(f"{PATH}/*")
+
     
-def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
+def test_model(test_df, tokenizer, model, device, wandb):
     test_dataset = CustomDataset(test_df, tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, tokenizer))
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
 
     model.eval()
     total_loss = 0.0
@@ -469,6 +392,10 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
 
             # Calculate the testing loss
             testing_loss = outputs.loss
+
+            # Need to average the loss if we are using DataParallel
+            if testing_loss.dim() > 0:
+                testing_loss = testing_loss.mean()
             total_loss += testing_loss.item()
 
             # Get the actual and predicted labels
@@ -490,8 +417,88 @@ def evaluate_data(test_df, tokenizer, batch_size, model, device, wandb):
     wandb.log({"accuracy": accuracy, "testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1})
 
     return average_loss
+    
+
+def evaluate_model(test_df):
+    """
+    Evaluate the model on the test data.
+
+    Args:
+        test_df (pd.DataFrame): DataFrame containing the test data.
+
+    Returns:
+        float: Average testing loss.
+    """
+    # Load model adapter
+    model, tokenizer = load_model_and_adapter()
+
+    # Use all available GPUs
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    test_dataset = CustomDataset(test_df, tokenizer)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
+    
+    total_loss = 0.0
+    total_actual_labels = []
+    total_predicted_labels = []
+
+    # Set the model to evaluation mode
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
+            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
+            # Forward pass
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+            # Get the probabilities
+            logits = outputs.logits
+
+            # Calculate the testing loss
+            testing_loss = outputs.loss
+
+            # Need to average the loss if we are using DataParallel
+            if testing_loss.dim() > 0:
+                testing_loss = testing_loss.mean()
+            total_loss += testing_loss.item()
+
+            # Get the actual and predicted labels
+            actual_labels = labels.cpu().numpy()
+            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
+            total_actual_labels.extend(actual_labels)
+            total_predicted_labels.extend(predicted_labels)
+
+        average_loss = total_loss / len(test_loader)
+
+        # Calculate the accuracy, precision, recall, f1 score of the positive class
+        true_labels_positive, predicted_labels_positive = filter_labels(total_actual_labels, total_predicted_labels)
+        accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
+        precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
+        recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
+        f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
+        
+        print(f'accuracy: {accuracy}, precision: {precision}, recall: {recall}, F1: {f1}')
+
+    return average_loss
+
 
 def filter_labels(true_labels, predicted_labels):
+    """
+    Filter true and predicted labels for the positive class.
+
+    Args:
+        true_labels (list): List of true labels.
+        predicted_labels (list): List of predicted labels.
+
+    Returns:
+        tuple: Tuple containing filtered true labels and filtered predicted labels for the positive class.
+    """
+
     # Get indices where true labels are 1
     positive_indices = [i for i, label in enumerate(true_labels) if label == 1]
 
@@ -503,30 +510,54 @@ def filter_labels(true_labels, predicted_labels):
 
     return true_labels_positive, predicted_labels_positive
 
+
 def save_model_and_adapter(model):
+    """
+    Save the model's adapter and log it as a WandB artifact.
+
+    Args:
+        model: The model with the adapter to save.
+    """
+    #torch.save(model.state_dict(), STATE_DICT_PATH)
+    path = os.path.join(os.getcwd(), "adapter-model")
+    
     # Save the entire model
-    model_path = "model.pth"
-    torch.save(model.state_dict(), model_path)
+    model.save_pretrained(path)
 
     # Save the adapter
-    adapter_path = "./adapter"
-    model.save_adapter(adapter_path, "mrpc", with_head=True)
+    model.save_adapter(path, ADAPTER_NAME)
+    
 
-    # Log the model artifact
-    artifact = wandb.Artifact("customized_codebert", type="model")
-    artifact.add_file(model_path)
-    artifact.add_dir(adapter_path)
-    wandb.log_artifact(artifact)
+def load_model_and_adapter():
+    """
+    Load the model and adapter from the specified path.
+
+    Returns:
+        PreTrainedModel: The model with the loaded adapter.
+    """
+    
+    # Load the tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoAdapterModel.from_pretrained(PATH)
+
+    # Load the adapter from the saved path and activate it
+    adapter_name = model.load_adapter(PATH)
+    model.set_active_adapters(adapter_name)
+    print(f"Loaded and activated adapter: {adapter_name}")
+    
+    return model, tokenizer
 
 
 def main():
-    dataset_folder, testing_size = sys.argv[-2:]
+    dataset_folder, test_size, mode = sys.argv[-3:]
     df = preprocess_data(dataset_folder)
-    df = df.reset_index(drop = True)
-    #df.to_csv("data.csv")
-    #df = pd.read_csv("data.csv")
-    train_model(df, float(testing_size), 101)
-
+    train_df, test_df = split_data(df, float(test_size))
+   
+    if mode == "train":
+        train_model(train_df, test_df)
+    elif mode == "test":
+        evaluate_model(test_df)
+    
  
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
