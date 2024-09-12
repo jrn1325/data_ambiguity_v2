@@ -307,7 +307,7 @@ def train_model(train_df, test_df):
 
     # Start a new wandb run to track this script
     wandb.init(
-        project="custom-codebert_all_files_" + str(num_epochs),
+        project="custom-codebert_all_files_25"),
         config={
             "accumulation_steps": accumulation_steps,
             "batch_size": BATCH_SIZE,
