@@ -1,4 +1,5 @@
 import json
+import jsonref
 import numpy as np
 import os
 import pandas as pd
@@ -6,14 +7,14 @@ import re
 import sys
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import tqdm
 import wandb
-
 from adapters import AutoAdapterModel
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from imblearn.over_sampling import RandomOverSampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 from transformers import AdamW, AutoTokenizer, get_scheduler
 
@@ -23,11 +24,91 @@ warnings.filterwarnings("ignore")
 # Create constant variables
 KEYS_TO_REMOVE = ["definitions", "$defs", "properties", "patternProperties", "oneOf", "allOf", "anyOf", "items"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
-RANDOM_VALUE = 101
-BATCH_SIZE = 64
+BATCH_SIZE = 100
 ADAPTER_NAME = "data_ambiguity"
 MODEL_NAME = "microsoft/codebert-base"
 PATH = "./adapter-model"
+# Use os.path.expanduser to expand '~' to the full home directory path
+SCHEMA_FOLDER = os.path.expanduser("~/Desktop/schemas")
+JSON_FOLDER = os.path.expanduser("~/Desktop/jsons")
+
+sys.setrecursionlimit(10000)
+
+
+def split_data(train_ratio=0.8, random_value=101):
+    """
+    Split the list of schemas into training and testing sets.
+
+    Args:
+        train_ratio (float, optional): The ratio of schemas to use for training. Defaults to 0.8.
+        random_value (int, optional): The random seed value. Defaults to 101.
+
+    Returns:
+        tuple: A tuple containing the training set and testing set.
+    """
+
+    # Get the list of schema filenames
+    schemas = os.listdir(SCHEMA_FOLDER)
+
+    # Use GroupShuffleSplit to split the schemas into train and test sets
+    gss = GroupShuffleSplit(train_size=train_ratio, random_state=random_value)
+
+    # Make sure that schema names with the same first 3 letters are grouped together because they are likely from the same source
+    train_idx, test_idx = next(gss.split(schemas, groups=[s[:4] for s in schemas]))
+
+    # Create lists of filenames for the train and test sets
+    train_set = [schemas[i] for i in train_idx]
+    test_set = [schemas[i] for i in test_idx]
+
+    return train_set, test_set
+
+
+def load_and_dereference_schema(schema_path):
+    """
+    Load the JSON schema from the specified path and dereference any $ref pointers.
+
+    Args:
+        schema_path (str): The path to the JSON schema file.
+
+    Returns:
+        dict: The dereferenced JSON schema.
+    """
+    
+    try:
+        with open(schema_path, 'r') as schema_file:
+            schema = jsonref.load(schema_file)
+            return schema
+    except Exception as e:
+        print(f"Error loading schema {schema_path}: {e}")
+    return
+    
+
+def extract_pattern_properties_parents(schema, path = ('$',)):
+    """Get the keys under "patternProperties" in JSON schemas, replacing 'items' with a star (*) in the path.
+
+    Args:
+        schema (dict): JSON schema
+        path (tuple, optional): path to key. Defaults to ('$').
+
+    Yields:
+        tuple: key path
+    """
+    if isinstance(schema, dict):
+        if "patternProperties" in schema:
+            yield path
+        elif "properties" not in schema and schema.get("additionalProperties", False) is not False:
+            yield path
+
+        for key, value in schema.items():
+            # If the key is "items", replace it with "*"
+            if key == "items":
+                yield from extract_pattern_properties_parents(value, path + ('*',))
+            else:
+                yield from extract_pattern_properties_parents(value, path + (key,))
+        
+    elif isinstance(schema, list):
+        for item in schema:
+            yield from extract_pattern_properties_parents(item, path + ('*',))
 
 
 def extract_paths(doc, path = ('$',), values = []):
@@ -48,8 +129,8 @@ def extract_paths(doc, path = ('$',), values = []):
         iterator = doc.items()
     elif isinstance(doc, list):
         if len(doc) > 0:
-            #iterator = [('*', doc[0])]
-            iterator = [] # We will handle lists later
+            iterator = [('*', item) for item in doc]
+            #iterator = []
         else:
             iterator = []
     else:
@@ -61,6 +142,45 @@ def extract_paths(doc, path = ('$',), values = []):
             yield from extract_paths(value, path + (key,), values)
     
 
+def match_properties(schema, document):
+    """Check if there is an intersection between the schema (properties or patternProperties) and the document.
+
+    Args:
+        schema (dict): JSON Schema object.
+        document (dict): JSON object.
+
+    Returns:
+        bool: True if there is a match, False otherwise.
+    """
+    # Check if the schema has 'properties' or 'patternProperties'
+    schema_properties = schema.get("properties", {})
+    pattern_properties = schema.get("patternProperties", {})
+
+    # Check if schema has additionalProperties set to true
+    additional_properties = schema.get("additionalProperties", False)
+
+    # Check for matching properties from 'properties' or 'patternProperties'
+    matching_properties_count = sum(1 for key in document if key in schema_properties)
+
+    # If patternProperties exist, match keys using regex patterns
+    for pattern, _ in pattern_properties.items():
+        for key in document:
+            if re.fullmatch(pattern, key):
+                matching_properties_count += 1
+
+    # If there are matching properties, return True
+    if matching_properties_count > 0:
+        return True
+
+    # If no properties are defined but additionalProperties is allowed, consider it a match
+    if additional_properties is True:
+        return True
+
+    # Return False if no match is found
+    return False
+
+
+
 def process_document(doc, prefix_paths_dict, path_types_dict): 
     """
     Extracts paths from the given JSON document and stores them in a dictionary,
@@ -71,10 +191,12 @@ def process_document(doc, prefix_paths_dict, path_types_dict):
         prefix_paths_dict (dict): A dictionary where the keys are path prefixes 
                                   (tuples of path segments, excluding the last segment),
                                   and the values are sets of full paths that share the same prefix.
-        path_types_dict, p): (dict): A dictionary where the keys are path prefixes and the values are lists of types of the nested keys.
+        path_types_dict: (dict): A dictionary where the keys are path prefixes and the values are lists of types of the nested keys.
     """
-    
     for path, value in extract_paths(doc):
+        # Skip paths containing keys that should be removed
+        if any(key in KEYS_TO_REMOVE for key in path):
+            continue
         if len(path) > 1:
             prefix = path[:-1]
             prefix_paths_dict[prefix].add(path)
@@ -102,6 +224,8 @@ def create_dataframe(prefix_paths_dict, dataset):
         if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
             distinct_subkeys = set(list(distinct_subkeys)[:DISTINCT_SUBKEYS_UPPER_BOUND])
 
+        if len(distinct_subkeys) == 1 and list(distinct_subkeys)[0] == '*':
+            continue
         # Append the path and the distinct subkeys to the data list
         data.append({
             "path": path,
@@ -118,107 +242,163 @@ def create_dataframe(prefix_paths_dict, dataset):
 def compare_tuples(tuple1, tuple2):
     """
     Compare two tuples element-wise, allowing for regular expression matching on elements in tuple2.
+    If item2 is a valid regex pattern (string), it tries to match item1 with item2 as a regex.
+    Otherwise, it performs direct equality comparison.
 
     Args:
-        tuple1 (tuple): The first tuple, typically containing actual values.
-        tuple2 (tuple): The second tuple, which may contain regex patterns as strings.
+        tuple1 (tuple): The first tuple, contains actual values.
+        tuple2 (tuple): The second tuple, which may contain regex patterns or direct values.
 
     Returns:
         bool: True if tuples are considered equal, False otherwise.
     """
-
+    
     if len(tuple1) != len(tuple2):
         return False
 
     for item1, item2 in zip(tuple1, tuple2):
-        if isinstance(item2, str) and re.match(item2, item1):
-            continue
-        elif item1 != item2:
+        if isinstance(item2, str):
+            try:
+                pattern = re.compile(item2)
+                if pattern.fullmatch(item1):
+                    continue
+            except re.error:
+                pass
+        
+        if item1 != item2:
             return False
+            
     return True
 
 
-def label_paths(dataset, df, dynamic_paths):
+def label_paths(df, dynamic_paths):
     """
     Label rows in the DataFrame as 1 if their 'path' matches any of the dynamic paths.
 
     Args:
-        dataset (str): The dataset name to compare with.
-        df (pd.DataFrame): The DataFrame containing 'path' and 'filename' columns.
+        df (pd.DataFrame): The DataFrame containing the paths.
         dynamic_paths (list): A list of dynamic paths to compare against.
-
-    Returns:
-        pd.DataFrame: The input DataFrame with an additional 'label' column, where 1 indicates a match with dynamic paths.
     """
     df["label"] = 0
 
-    for key_path in dynamic_paths:
-        if "items" in key_path:
-            continue
-        key_path = tuple([i for i in key_path if i not in KEYS_TO_REMOVE])
+    for path in dynamic_paths:
+        path = tuple([i for i in path if i not in KEYS_TO_REMOVE])
 
         for index, row in df.iterrows():
-            if compare_tuples(row["path"], key_path) and row["filename"] == dataset:
+            if compare_tuples(row["path"], path):
                 df.at[index, "label"] = 1
-    return df
 
 
-def extract_pattern_properties_parents(schema, path = ('$',)):
-    """Get the keys under "patternProperties" in JSON schemas
+def process_single_dataset(dataset, files_folder):
+    """
+    Process a single dataset to create and label a DataFrame.
 
     Args:
-        schema (dict): JSON schema
-        path (tuple, optional): path to key. Defaults to ().
+        dataset (str): The name of the dataset file.
+        files_folder (str): The folder where the dataset files are stored.
 
-    Yields:
-        tuple: key path
+    Returns:
+        pd.DataFrame or None: A DataFrame for the dataset with labeled paths, or None if the dataset cannot be processed.
     """
-    if isinstance(schema, dict):
-        if "patternProperties" in schema:
-            yield path
-        elif "properties" not in schema and schema.get("additionalProperties", False) is not False:
-            yield path
 
-        for key, value in schema.items():
-            yield from extract_pattern_properties_parents(value, path + (key,))
-                
-    elif isinstance(schema, list):
-        for index, item in enumerate(schema):
-            yield from extract_pattern_properties_parents(item, path)
-
-
-def preprocess_data(files_folder):
-    frames = []
-
-    datasets = os.listdir(files_folder)
-    for dataset in tqdm.tqdm(datasets):
-        schema_path = os.path.join("valid_schemas", dataset)
-        with open(schema_path, 'r') as schema_file:
-            json_schema = json.load(schema_file)
-            dynamic_paths = list(extract_pattern_properties_parents(json_schema))
-            if not dynamic_paths:
-                continue
-        prefix_paths_dict = defaultdict(set)
-        path_types_dict = defaultdict(set)
+    schema_path = os.path.join(SCHEMA_FOLDER, dataset)
+    # Load and dereference the schema
+    schema = load_and_dereference_schema(schema_path)
     
+    try:
+        if schema:
+            dynamic_paths = list(extract_pattern_properties_parents(schema))
+    
+            if dynamic_paths:
+                prefix_paths_dict = defaultdict(set)
+                path_types_dict = defaultdict(set)
 
-        with open(os.path.join(files_folder, dataset), 'r') as file:
-            for count, line in enumerate(file):
-                doc = json.loads(line)
-                process_document(doc, prefix_paths_dict, path_types_dict)
+                # Read the JSON documents from the file
+                with open(os.path.join(files_folder, dataset), 'r') as file:
+                    for line in file:
+                        try:
+                            doc = json.loads(line)
+                            if match_properties(schema, doc):
+                                process_document(doc, prefix_paths_dict, path_types_dict)
+                        except Exception as e:
+                            continue
+            else:
+                return None
+        else:
+            return None
+    except Exception as e:
+        print(f"Error processing {dataset}: {e}")
+        return None
 
-        #sys.stderr.write(f"Creating a dataframe for {dataset}\n")
-        df = create_dataframe(prefix_paths_dict, dataset)
-            
-        #sys.stderr.write(f"Labeling data for {dataset}\n")
-        df = label_paths(dataset, df, dynamic_paths)
-        frames.append(df)
+    # Create a dataframe for this dataset
+    df = create_dataframe(prefix_paths_dict, dataset)
 
-    sys.stderr.write('Merging dataframes...\n')
-    df = pd.concat(frames, ignore_index = True)
-    df = df.reset_index(drop = True)
+    # Label paths in the dataframe
+    label_paths(df, dynamic_paths)
     
     return df
+
+
+def resample_data(df):
+    """
+    Resample the data to balance the classes by oversampling the minority class 
+    to 50% of the size of the majority class.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing the data to resample.
+
+    Returns:
+        pd.DataFrame: The resampled DataFrame.
+    """
+    # Separate features (X) and target (y)
+    X = df.drop(columns=["label"]) 
+    y = df["label"]
+
+    # Initialize the oversampler
+    oversample = RandomOverSampler(sampling_strategy=1, random_state=101)
+
+    # Apply the oversampler
+    X_resampled, y_resampled = oversample.fit_resample(X, y)
+
+    # Create a new DataFrame with the resampled data
+    df_resampled = pd.concat([pd.DataFrame(X_resampled, columns=X.columns), pd.DataFrame(y_resampled, columns=["label"])], axis=1)
+    return df_resampled
+
+
+def preprocess_data(schema_list, files_folder):
+    """
+    Preprocess all dataset files in a folder, parallelizing the task across multiple CPUs.
+
+    Args:
+        schema_list (list): List of schema files to use for processing.
+        files_folder (str): The folder containing the dataset files.
+
+    Returns:
+        pd.DataFrame: A merged DataFrame containing labeled data from all datasets.
+    """
+    datasets = os.listdir(files_folder)
+
+    # Filter datasets to only include files that match those in schema_list
+    datasets = [dataset for dataset in datasets if dataset in schema_list]
+    '''
+    for i, dataset in enumerate(datasets):
+        if dataset != "ecosystem-json.json":
+            continue
+        df = process_single_dataset(dataset, files_folder)
+    '''    
+    
+    # Process each dataset in parallel
+    with ProcessPoolExecutor() as executor:
+        frames = list(tqdm.tqdm(executor.map(process_single_dataset, datasets, [files_folder] * len(datasets)), total=len(datasets)))
+
+    # Filter out any datasets that returned None
+    frames = [df for df in frames if df is not None]
+
+    sys.stderr.write('Merging dataframes...\n')
+    df = pd.concat(frames, ignore_index=True)
+
+    return df
+
 
 
 
@@ -288,15 +468,6 @@ def initialize_model():
     model.train_adapter(ADAPTER_NAME)
     wandb.watch(model)
     return model, tokenizer
-
-
-def split_data(df, test_size):
-    # Split the data into training and testing sets based on filenames
-    filenames = df["filename"].tolist()
-    train_filenames, test_filenames = train_test_split(filenames, test_size=test_size, random_state=RANDOM_VALUE)
-    train_df = df[df["filename"].isin(train_filenames)]
-    test_df = df[df["filename"].isin(test_filenames)]
-    return train_df, test_df
    
 
 def train_model(train_df, test_df):
@@ -346,8 +517,7 @@ def train_model(train_df, test_df):
         num_training_steps=num_training_steps,
     )
 
-    early_stopper = EarlyStopper(patience=5, min_delta=0.005)
-
+    early_stopper = EarlyStopper(patience=5, min_delta=0.005) # training stips if the validation loss does not decrease by at least 10 for 5 consecutive epochs
 
     # Train the model
     model.train()
@@ -387,7 +557,7 @@ def train_model(train_df, test_df):
             break
         
     # Save the adapter
-    save_model_and_adapter(model)
+    save_model_and_adapter(model.module)
 
     wandb.save(f"{PATH}/*")
 
@@ -570,17 +740,40 @@ def load_model_and_adapter():
 
 
 def main():
-    dataset_folder, test_size, mode = sys.argv[-3:]
-    df = preprocess_data(dataset_folder)
-    train_df, test_df = split_data(df, float(test_size))
+    try:
+        # Parse command-line arguments
+        files_folder, train_size, random_value, mode = sys.argv[-4:]
+        train_ratio = float(train_size)
+        random_value = int(random_value)
 
-   
-    if mode == "train":
-        train_model(train_df, test_df)
-    elif mode == "test":
-        evaluate_model(test_df)
-    else:
-        print("Invalid mode. Please specify 'train' or 'test'.")
+        # Ensure mode is valid
+        if mode not in {"train", "test"}:
+            raise ValueError("Invalid mode. Use 'train' or 'test'.")
+        
+        # Split the data into training and testing sets
+        train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
+
+        # Preprocess and oversample the training data
+        train_df = preprocess_data(train_set, files_folder)
+        #df_resampled = resample_data(train_df)
+        #sorted_df = df_resampled.sort_values(by="filename")
+        train_df.to_csv("train_data.csv", index=False)
+
+        # Preprocess the testing data
+        test_df = preprocess_data(test_set, files_folder)
+        test_df.to_csv("test_data.csv", index=False)
+        
+        #train_df = pd.read_csv("train_data.csv")
+        #test_df = pd.read_csv("test_data.csv")
+        
+        # Execute the chosen mode
+        if mode == "train":
+            train_model(train_df, test_df)
+        else:  # mode == "test"
+            evaluate_model(test_df)
+
+    except (ValueError, IndexError) as e:
+        print(f"Error: {e}\nUsage: script.py <files_folder> <train_size> <random_value> <mode>")
         sys.exit(1)
     
  
