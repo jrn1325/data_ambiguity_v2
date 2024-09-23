@@ -12,7 +12,7 @@ import wandb
 from adapters import AutoAdapterModel
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-#from imblearn.over_sampling import RandomOverSampler
+from imblearn.over_sampling import RandomOverSampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 # Create constant variables
 SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
-BATCH_SIZE = 96
+BATCH_SIZE = 120
 MAX_TOKEN_LEN = 512
 ADAPTER_NAME = "data_ambiguity"
 MODEL_NAME = "microsoft/codebert-base"
@@ -36,7 +36,7 @@ JSON_FOLDER = os.path.expanduser("~/Desktop/jsons")
 
 def split_data(train_ratio=0.8, random_value=101):
     """
-    Split the list of schemas into training and testing sets.
+    Split the list of schemas into training and testing sets making sure that schemas from the same source are grouped together.
 
     Args:
         train_ratio (float, optional): The ratio of schemas to use for training. Defaults to 0.8.
@@ -82,7 +82,7 @@ def load_and_dereference_schema(schema_path):
     return {}
     
 
-def extract_implicit_schema_paths(schema, current_path=('$',)):
+def extract_implicit_schema_paths(schema, current_path=("$",)):
     """
     Extracts paths from a JSON schema where properties are not explicitly defined in the schema.
     
@@ -102,7 +102,7 @@ def extract_implicit_schema_paths(schema, current_path=('$',)):
         additional_props = schema.get("additionalProperties", True)
         if additional_props is True or isinstance(additional_props, dict) or "patternProperties" in schema:
             yield current_path
-
+   
     # Process properties
     for key, value in schema.get("properties", {}).items():
         yield from extract_implicit_schema_paths(value, current_path + (key,))
@@ -119,16 +119,16 @@ def extract_implicit_schema_paths(schema, current_path=('$',)):
     for item in schema.get("prefixItems", []):
         yield from extract_implicit_schema_paths(item, current_path + ("*",))
 
-    # Process conditional schema keywords like 'then'
+    # Process conditional schema keywords like then
     if "then" in schema:
         yield from extract_implicit_schema_paths(schema["then"], current_path)
   
 
-def extract_paths(doc, path = ('$',), values = []):
-    """Get the path of each key and its value from the json documents
+def extract_paths(doc, path = ("$",), values = []):
+    """Get the path of each key and its value from the json documents.
 
     Args:
-        doc (dict): JSON document
+        doc (dict): JSON document.
         path (tuple, optional): list of keys full path. Defaults to ('$',).
         values (list, optional): list of keys' values. Defaults to [].
 
@@ -141,13 +141,9 @@ def extract_paths(doc, path = ('$',), values = []):
     if isinstance(doc, dict):
         iterator = doc.items()
     elif isinstance(doc, list):
-        if len(doc) > 0:
-            iterator = [('*', item) for item in doc]
-            #iterator = []
-        else:
-            iterator = []
+        iterator = [('*', item) for item in doc] if doc else []
     else:
-        raise ValueError("Invalid type")
+        raise ValueError("Expected dict or list, got {}".format(type(doc).__name__))
   
     for key, value in iterator:
         yield path + (key,), value
@@ -229,7 +225,7 @@ def create_dataframe(prefix_paths_dict, dataset):
     for path, subpaths in prefix_paths_dict.items():
         distinct_subkeys = {k[-1] for k in subpaths}
         
-        # Limit the number of distinct subkeys collected to the upper bound
+        # Limit the number of distinct subkeys
         if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
             distinct_subkeys = set(list(distinct_subkeys)[:DISTINCT_SUBKEYS_UPPER_BOUND])
 
@@ -291,9 +287,6 @@ def is_descendant_of(path, ancestor):
     if len(path) <= len(ancestor):
         return False
     return path[:len(ancestor)] == ancestor
-    #if len(path) == len(ancestor) + 1:
-    #    return path[:len(ancestor)] == ancestor
-    #return False
 
 
 def label_paths(df, dynamic_paths):
@@ -313,8 +306,8 @@ def label_paths(df, dynamic_paths):
         path = row["path"]
 
         # Check if the current path is in dynamic paths or a descendant of a dynamic path
-        #if any(compare_tuples(path, dp) for dp in dynamic_paths):
-        if any(compare_tuples(path, dp) or is_descendant_of(path, dp) for dp in dynamic_paths):
+        if any(compare_tuples(path, dp) for dp in dynamic_paths):
+        #if any(compare_tuples(path, dp) or is_descendant_of(path, dp) for dp in dynamic_paths):
            df.at[index, "label"] = 1
 
 
@@ -341,7 +334,6 @@ def process_single_dataset(dataset, files_folder):
                 prefix_paths_dict = defaultdict(set)
                 path_types_dict = defaultdict(set)
 
-                # Read the JSON documents from the file
                 with open(os.path.join(files_folder, dataset), 'r') as file:
                     for line in file:
                         try:
@@ -358,10 +350,7 @@ def process_single_dataset(dataset, files_folder):
         print(f"Error processing {dataset}: {e}")
         return None
 
-    # Create a dataframe for this dataset
     df = create_dataframe(prefix_paths_dict, dataset)
-
-    # Label paths in the dataframe
     label_paths(df, dynamic_paths)
     #df.to_csv(f"{dataset}_data.csv", index=False)
     #xxx
@@ -410,6 +399,7 @@ def preprocess_data(schema_list, files_folder):
 
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
+
     '''
     for i, dataset in enumerate(datasets):
         if dataset != "now.json":#ecosystem-json.json":
@@ -792,7 +782,6 @@ def main():
         test_df = preprocess_data(test_set, files_folder)
         test_df.to_csv("test_data.csv", index=False)
         xxx
-        
         #train_df = pd.read_csv("train_data.csv")
         #test_df = pd.read_csv("test_data.csv")
         
