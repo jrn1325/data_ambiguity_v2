@@ -12,7 +12,7 @@ import wandb
 from adapters import AutoAdapterModel
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from imblearn.over_sampling import RandomOverSampler
+#from imblearn.over_sampling import RandomOverSampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
@@ -82,16 +82,125 @@ def load_and_dereference_schema(schema_path):
     return {}
     
 
+def has_pattern_properties(schema):
+    """
+    Recursively checks if patternProperties exist in the schema.
+
+    Args:
+        schema (dict): The JSON schema to check.
+
+    Returns:
+        bool: True if patternProperties is found, False otherwise.
+    """
+    if not isinstance(schema, dict):
+        return False
+
+    if "patternProperties" in schema:
+        return True
+
+    # Recursively check for patternProperties in nested schemas
+    for key in ["properties", "items", "additionalProperties", "prefixItems", "anyOf", "oneOf", "allOf", "then"]:
+        if key in schema:
+            value = schema[key]
+            if isinstance(value, dict):
+                if has_pattern_properties(value):
+                    return True
+            elif isinstance(value, list):
+                for item in value:
+                    if has_pattern_properties(item):
+                        return True
+    return False
+
+
+def handle_additional_properties(schema, current_path):
+    """
+    Handle additionalProperties in the JSON schema.
+    
+    Args:
+        schema (dict): The JSON schema containing additionalProperties.
+        current_path (tuple): The current path in the schema hierarchy.
+        
+    Yields:
+        tuple: Paths based on the additionalProperties settings.
+    """
+    additional_props = schema.get("additionalProperties")
+    
+    if additional_props is False:
+        yield current_path 
+    elif additional_props is True:
+        yield current_path + ("wildpath",) 
+    elif isinstance(additional_props, dict):
+        if "additionalProperties" in additional_props and additional_props["additionalProperties"] is False:
+            yield current_path 
+        else:
+            yield current_path + ("wildpath",) 
+        yield from extract_static_schema_paths(additional_props, current_path)
+
+
+def extract_static_schema_paths(schema, current_path=("$",)):
+    """
+    Extracts paths from a JSON schema where properties are explicitly defined.
+    Handles `additionalProperties` and `properties` correctly.
+    
+    Args:
+        schema (dict): The JSON schema to extract paths from.
+        current_path (tuple): The current path in the schema hierarchy, defaults to ("$",).
+        
+    Yields:
+        tuple: Explicitly defined property paths whose values are of type dict.
+    """
+
+    if not isinstance(schema, dict):
+        return
+
+    # Process defined properties
+    if "properties" in schema:
+        for key, value in schema["properties"].items():
+            new_path = current_path + (key,)
+
+            if isinstance(value, dict):
+                if value.get("type") == "object":
+                    yield from handle_additional_properties(value, new_path) 
+
+                yield from extract_static_schema_paths(value, new_path)
+
+    # Handle additionalProperties
+    if "additionalProperties" in schema:
+        yield from handle_additional_properties(schema, current_path)
+
+    # Handle array-related keywords
+    if schema.get("type") == "array":
+        if "items" in schema:
+            if isinstance(schema["items"], dict):
+                yield from extract_static_schema_paths(schema["items"], current_path + ("*",))
+
+        for item in schema.get("prefixItems", []):
+            if isinstance(item, dict):
+                yield from extract_static_schema_paths(item, current_path + ("*",))
+
+    # Process other schema keywords like `anyOf`, `oneOf`, `allOf`, and `then`
+    for applicator in ["anyOf", "oneOf", "allOf"]:
+        for item in schema.get(applicator, []):
+            if isinstance(item, dict):
+                yield from extract_static_schema_paths(item, current_path)
+
+    if "then" in schema and isinstance(schema["then"], dict):
+        yield from extract_static_schema_paths(schema["then"], current_path)
+
+
 def extract_implicit_schema_paths(schema, current_path=("$",)):
     """
-    Extracts paths from a JSON schema where properties are not explicitly defined in the schema.
-    
+    Extracts paths from a JSON schema where properties are not explicitly defined,
+    yielding a path and a binary flag based on the structure of additionalProperties.
+
     Args:
         schema (dict or list): The JSON schema to extract paths from.
         current_path (tuple): The current path in the schema hierarchy.
         
     Yields:
-        tuple: Paths in the schema where properties are not explicitly defined.
+        tuple: A tuple containing the path and a binary flag.
+               1 if additionalProperties is a structured object,
+               2 if additionalProperties is not structured or is not declared.
     """
     
     if not isinstance(schema, dict):
@@ -101,7 +210,7 @@ def extract_implicit_schema_paths(schema, current_path=("$",)):
     if schema.get("type") == "object":
         additional_props = schema.get("additionalProperties", True)
         if additional_props is True or isinstance(additional_props, dict) or "patternProperties" in schema:
-            yield current_path
+            yield current_path, 1
    
     # Process properties
     for key, value in schema.get("properties", {}).items():
@@ -273,42 +382,50 @@ def compare_tuples(tuple1, tuple2):
     return True
 
 
-def is_descendant_of(path, ancestor):
+def is_descendant(path, prefix_path):
     """
-    Check if a path is a descendant of the given ancestor path.
-
+    Check if a given path is a descendant of a prefix path.
+    
     Args:
-        path (tuple): The full path tuple to check.
-        ancestor (tuple): The ancestor path tuple to compare against.
-
+        path (tuple): The tuple-based path to check.
+        prefix_path (tuple): A prefix of the path ending with 'wildpath' to compare against.
+    
     Returns:
-        bool: True if the path is a descendant of the ancestor, False otherwise.
+        bool: True if the path is a descendant of the static path, False otherwise.
     """
-    if len(path) <= len(ancestor):
-        return False
-    return path[:len(ancestor)] == ancestor
+    # Check if the path starts with the prefix path and has additional elements
+    return path[:len(prefix_path)] == prefix_path and len(path) > len(prefix_path)
 
 
-def label_paths(df, dynamic_paths):
+def label_paths(df, static_paths):
     """
-    Label rows in the DataFrame as 1 if their 'path' matches any of the dynamic paths or
-    is a descendant of a dynamic path that is not explicitly defined.
+    Label rows in the DataFrame as:
+    - 0 for static paths and their descendants
+    - 1 for the prefix path of static paths containing 'wildpath'
 
     Args:
-        df (pd.DataFrame): The DataFrame containing the paths.
-        dynamic_paths (set): A set of dynamic paths to compare against.
+        df (pd.DataFrame): The DataFrame containing the paths as tuples.
+        static_paths (set): A set of static paths to compare against.
     """
-    # Initialize all paths with label 0
-    df["label"] = 0
+    # Initialize the label column with default value of 1
+    df["label"] = 1
 
-    # Label paths that match dynamic paths or their descendants
-    for index, row in df.iterrows():
-        path = row["path"]
+    for static_path in static_paths:
+        # Label the static path itself as 0
+        df.loc[df["path"] == static_path, "label"] = 0
 
-        # Check if the current path is in dynamic paths or a descendant of a dynamic path
-        if any(compare_tuples(path, dp) for dp in dynamic_paths):
-        #if any(compare_tuples(path, dp) or is_descendant_of(path, dp) for dp in dynamic_paths):
-           df.at[index, "label"] = 1
+        # Check if the static path ends with 'wildpath' for labeling its prefix
+        if static_path[-1] == "wildpath":
+            prefix_path = static_path[:-1]
+
+            # Label the prefix path as 1 if it exists in the DataFrame
+            if prefix_path in df["path"].values:
+                df.loc[df["path"] == prefix_path, "label"] = 1
+
+            # Label all descendants of this prefix path as 0
+            for index, row in df.iterrows():
+                if is_descendant(row["path"], prefix_path):
+                    df.at[index, "label"] = 0
 
 
 def process_single_dataset(dataset, files_folder):
@@ -328,9 +445,14 @@ def process_single_dataset(dataset, files_folder):
     
     try:
         if schema:
-            dynamic_paths = set(extract_implicit_schema_paths(schema))
-    
-            if dynamic_paths:
+            if has_pattern_properties(schema):
+                print(f"Skipping {dataset} due to patternProperties in the schema.")
+                return None
+            #dynamic_paths = set(extract_implicit_schema_paths(schema))
+            static_paths = set(extract_static_schema_paths(schema))
+            #print(static_paths)
+            
+            if static_paths:
                 prefix_paths_dict = defaultdict(set)
                 path_types_dict = defaultdict(set)
 
@@ -342,6 +464,11 @@ def process_single_dataset(dataset, files_folder):
                                 process_document(doc, prefix_paths_dict, path_types_dict)
                         except Exception as e:
                             continue
+                df = create_dataframe(prefix_paths_dict, dataset)
+                label_paths(df, static_paths)
+                #df.to_csv(f"{dataset}_data.csv", index=False)
+                #xxx
+                return df
             else:
                 return None
         else:
@@ -349,13 +476,6 @@ def process_single_dataset(dataset, files_folder):
     except Exception as e:
         print(f"Error processing {dataset}: {e}")
         return None
-
-    df = create_dataframe(prefix_paths_dict, dataset)
-    label_paths(df, dynamic_paths)
-    #df.to_csv(f"{dataset}_data.csv", index=False)
-    #xxx
-    
-    return df
 
 
 def resample_data(df):
@@ -399,10 +519,9 @@ def preprocess_data(schema_list, files_folder):
 
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
-
-    '''
+    ''' 
     for i, dataset in enumerate(datasets):
-        if dataset != "now.json":#ecosystem-json.json":
+        if dataset != "all-contributors-configuration-file.json":#ecosystem-json.json":
             continue
         df = process_single_dataset(dataset, files_folder)
         xxx
@@ -419,7 +538,6 @@ def preprocess_data(schema_list, files_folder):
     df = pd.concat(frames, ignore_index=True)
 
     return df
-
 
 
 
@@ -777,11 +895,11 @@ def main():
         #train_df = resample_data(train_df)
         train_df = train_df.sort_values(by=["filename", "path"])
         train_df.to_csv("train_data.csv", index=False)
-        
+    
         # Preprocess the testing data
         test_df = preprocess_data(test_set, files_folder)
         test_df.to_csv("test_data.csv", index=False)
-        xxx
+        
         #train_df = pd.read_csv("train_data.csv")
         #test_df = pd.read_csv("test_data.csv")
         
