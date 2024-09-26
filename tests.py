@@ -60,43 +60,62 @@ class TestExtractStaticSchemaPaths(unittest.TestCase):
             with open(os.path.join("test_schemas", filename), 'r') as f:
                 self.schemas[filename] = json.load(f)
     
-    def test_schema_1(self): 
+    def test_schema_1(self): # No additional properties are allowed
         schema = self.schemas["test1.json"]
-        expected_paths = {("$", "address"), ("$", "person")}
-        actual_paths = set(da.extract_static_schema_paths(schema))
-        self.assertCountEqual(actual_paths, expected_paths)
-    
-    def test_schema_2(self):
-        schema = self.schemas["test2.json"]
-        expected_paths = {("$", "address"), ("$", "person")}
-        actual_paths = set(da.extract_static_schema_paths(schema))
-        self.assertCountEqual(actual_paths, expected_paths)
-    
-    def test_schema_3(self):
-        schema = self.schemas["test3.json"]
-        expected_paths = {("$", "address"), ("$", "address", "**"), ("$", "person")}
+        expected_paths = {("$",), ("$", "address"), ("$", "person")}
         actual_paths = set(da.extract_static_schema_paths(schema))
         print(actual_paths)
         self.assertCountEqual(actual_paths, expected_paths)
     
-    def test_schema_4(self):
-        schema = self.schemas["test4.json"]
-        expected_paths = {("$", "address"), ("$", "person")}
+    def test_schema_2(self): # Additional properties is true for address
+        schema = self.schemas["test2.json"]
+        expected_paths = {("$",), ("$", "address", "wildpath"), ("$", "person")}
         actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
         self.assertCountEqual(actual_paths, expected_paths)
     
-    def test_schema_5(self):
+    def test_schema_3(self): # Additional properties is an object for address
+        schema = self.schemas["test3.json"]
+        expected_paths = {("$",), ("$", "address", "wildpath"), ("$", "person")}
+        actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
+        self.assertCountEqual(actual_paths, expected_paths)
+    
+    def test_schema_4(self): # additionalProperties is not declared for address
+        schema = self.schemas["test4.json"]
+        expected_paths = {("$",), ("$", "person")}
+        actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
+        self.assertCountEqual(actual_paths, expected_paths)
+    
+    def test_schema_5(self): # No additional properties are allowed at the top level
         schema = self.schemas["test5.json"]
         expected_paths = {("$", "address"), ("$", "person")}
         actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
         self.assertCountEqual(actual_paths, expected_paths)
     '''
-    def test_schema_6(self):
+    def test_schema_6(self): # Pattern properties are used
         schema = self.schemas["test6.json"]
         expected_paths = [("$", "address")]
         actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
         self.assertCountEqual(actual_paths, expected_paths)
     '''
+    def test_schema_7(self): # Additional properties set to false in additionalProperties of types
+        schema = self.schemas["test7.json"]
+        expected_paths = [("$",), ("$", "types"), ("$", "types", "symbol")]
+        actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
+        self.assertCountEqual(actual_paths, expected_paths)
+    
+    def test_schema_8(self): # Additional properties not declared in additionalProperties of types
+        schema = self.schemas["test8.json"]
+        expected_paths = [("$",), ("$", "types", "wildpath")]
+        actual_paths = set(da.extract_static_schema_paths(schema))
+        print(actual_paths)
+        self.assertCountEqual(actual_paths, expected_paths)
+    
 
 if __name__ == "__main__":
     unittest.TextTestRunner().run(unittest.TestLoader().loadTestsFromTestCase(TestExtractStaticSchemaPaths))
