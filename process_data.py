@@ -180,57 +180,95 @@ def match_properties(schema, document):
     return False
 
 
-def process_document(doc, prefix_paths_dict, path_types_dict): 
+def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict):
     """
-    Extracts paths from the given JSON document and stores them in a dictionary,
-    grouping paths that share the same prefix.
+    Extracts paths from the given JSON document and stores them in dictionaries,
+    grouping paths that share the same prefix and capturing the frequency and data type of nested keys.
 
     Args:
         doc (dict): The JSON document from which paths are extracted.
         prefix_paths_dict (dict): A dictionary where the keys are path prefixes 
                                   (tuples of path segments, excluding the last segment),
                                   and the values are sets of full paths that share the same prefix.
-        path_types_dict: (dict): A dictionary where the keys are path prefixes and the values are lists of types of the nested keys.
+        path_types_dict (dict): A dictionary where the keys are path prefixes and 
+                                the values are dictionaries with nested key information 
+                                (frequency and data type).
+        parent_frequency_dict (dict): A dictionary to track the frequency of parent keys.
     """
+    
     for path, value in extract_paths(doc):
         if len(path) > 1:
             prefix = path[:-1]
+            # Add the path to the prefix_paths_dict
             prefix_paths_dict[prefix].add(path)
-        #path_types_dict[path].add(type(value).__name__)
+
+            # Initialize or update the frequency and type information
+            if prefix not in path_types_dict:
+                path_types_dict[prefix] = {}
+
+            # Get the type of the current value
+            value_type = type(value).__name__
+
+            # Update the frequency count for the nested key
+            nested_key = path[-1]
+            if nested_key in path_types_dict[prefix]:
+                path_types_dict[prefix][nested_key]["frequency"] += 1
+            else:
+                path_types_dict[prefix][nested_key] = {"frequency": 1, "type": value_type}
+
+            # Update parent frequency
+            if prefix in parent_frequency_dict:
+                parent_frequency_dict[prefix] += 1
+            else:
+                parent_frequency_dict[prefix] = 1
 
 
-def create_dataframe(prefix_paths_dict, dataset):
+def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset):
     """
     Create a DataFrame from dictionaries containing path types and path prefixes.
 
     Args:
         prefix_paths_dict (dict): A dictionary where keys are path prefixes and values are sets of paths.
+        path_types_dict (dict): A dictionary containing frequency and type information for each nested key's value.
+        parent_frequency_dict (dict): A dictionary with the frequency of parent keys.
         dataset (str): The name of the dataset.
 
     Returns:
-        pd.DataFrame: A DataFrame with 'path', 'distinct_subkeys', and 'filename' columns.
+        pd.DataFrame: A DataFrame with 'path', 'schema', and 'filename' columns.
     """
     data = []
 
-    # Get the distinct subkeys under each path
+    # Get the nested keys and their details under each path
     for path, subpaths in prefix_paths_dict.items():
-        distinct_subkeys = {k[-1] for k in subpaths}
-        
-        # Limit the number of distinct subkeys
-        if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
-            distinct_subkeys = set(list(distinct_subkeys)[:DISTINCT_SUBKEYS_UPPER_BOUND])
+        schema_info = []  
 
-        if len(distinct_subkeys) == 1 and list(distinct_subkeys)[0] == '*':
-            continue
-        # Append the path and the distinct subkeys to the data list
+        # Gather distinct subkeys and their frequencies and types
+        for subpath in subpaths:
+            nested_key = subpath[-1]  
+            if nested_key in path_types_dict.get(path, {}):
+                nested_key_info = path_types_dict[path][nested_key]
+                frequency = nested_key_info["frequency"]
+                value_type = nested_key_info["type"]
+
+                # Calculate relative frequency
+                parent_frequency = parent_frequency_dict.get(path, 1)  # Default to 1 to avoid division by zero
+                relative_frequency = frequency / parent_frequency
+
+                schema_info.append({
+                    "property": nested_key,
+                    "relative_frequency": relative_frequency,
+                    "type": value_type
+                })
+        
+        # Append the path and the schema info to the data list
         data.append({
             "path": path,
-            "distinct_subkeys": json.dumps(list(distinct_subkeys))
+            "schema": schema_info,
+            "filename": dataset
         })
-    
+
     # Create the DataFrame from the data list
     df = pd.DataFrame(data)
-    df["filename"] = dataset
     
     return df
 
@@ -287,8 +325,6 @@ def extract_static_schema_paths(schema, current_path=("$",)):
         # Handle additionalProperties for nested schemas within additionalProperties
         if isinstance(current_schema.get("additionalProperties"), dict):
             stack.append((current_schema["additionalProperties"], current_path))
-
-
 
 
 def extract_implicit_schema_paths(schema, current_path=("$",)):
@@ -423,7 +459,8 @@ def process_dataset(dataset, files_folder):
         pd.DataFrame or None: A DataFrame for the dataset, or None if no data is processed.
     """
     prefix_paths_dict = defaultdict(set)
-    path_types_dict = defaultdict(set)
+    path_types_dict = {}
+    parent_frequency_dict = defaultdict(int)
 
     # Load and dereference the schema if needed
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
@@ -436,7 +473,8 @@ def process_dataset(dataset, files_folder):
             doc = json.loads(line)
             try:                    
                 if match_properties(dereferenced_schema, doc):
-                    process_document(doc, prefix_paths_dict, path_types_dict)
+                    process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict)
+                    
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
@@ -445,12 +483,9 @@ def process_dataset(dataset, files_folder):
         print(f"No paths extracted from {dataset}.")
         return None
     
-    df = create_dataframe(prefix_paths_dict, dataset)
-    print(f"Extracting static paths from {dataset}.")
+    df = create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset)
+    #print(f"Extracting static paths from {dataset}.")
     static_paths = set(extract_static_schema_paths(dereferenced_schema))
-    #print(static_paths)
-    #xxx
-    #print()
     #print(f"Labeling paths in {dataset}.")
     label_paths(df, static_paths)
         
