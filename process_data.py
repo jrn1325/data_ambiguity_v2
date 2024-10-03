@@ -198,6 +198,9 @@ def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_d
     
     for path, value in extract_paths(doc):
         if len(path) > 1:
+            nested_key = path[-1]
+            if nested_key == "*":
+                continue
             prefix = path[:-1]
             # Add the path to the prefix_paths_dict
             prefix_paths_dict[prefix].add(path)
@@ -210,7 +213,7 @@ def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_d
             value_type = type(value).__name__
 
             # Update the frequency count for the nested key
-            nested_key = path[-1]
+            
             if nested_key in path_types_dict[prefix]:
                 path_types_dict[prefix][nested_key]["frequency"] += 1
             else:
@@ -251,7 +254,7 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
                 value_type = nested_key_info["type"]
 
                 # Calculate relative frequency
-                parent_frequency = parent_frequency_dict.get(path, 1)  # Default to 1 to avoid division by zero
+                parent_frequency = parent_frequency_dict.get(path, 1) 
                 relative_frequency = frequency / parent_frequency
 
                 schema_info.append({
@@ -271,6 +274,57 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
     df = pd.DataFrame(data)
     
     return df
+
+
+def get_object_paths(schema, parent_path=("$",)):
+    """
+    Recursively traverse a JSON schema and collect full paths of properties where type is 'object',
+    returning the paths as tuples and excluding paths for dynamic nested keys.
+    
+    :param schema: The JSON schema (dict)
+    :param parent_path: The current path accumulated as a tuple (default is the root)
+    :return: A generator yielding full paths of object-type properties as tuples
+    """
+    
+    # Check if 'properties' exist in the schema
+    if "properties" in schema:
+        for prop, prop_schema in schema["properties"].items():
+            # Construct the full path as a tuple
+            full_path = parent_path + (prop,)
+            
+            # Ensure prop_schema is a dictionary
+            if isinstance(prop_schema, dict):
+                if prop_schema.get("type") == "object":
+                    # Ensure nested properties are well-defined, and dynamic keys are not allowed
+                    if 'properties' in prop_schema:
+                        # Only yield if additionalProperties is explicitly set to False
+                        if prop_schema.get("additionalProperties") == False:
+                            yield full_path
+                            yield from get_object_paths(prop_schema, full_path)
+                    # If no properties are defined, also ensure additionalProperties is False
+                    elif prop_schema.get("additionalProperties") == False:
+                        yield full_path
+                        yield from get_object_paths(prop_schema, full_path)
+
+    # Handle arrays containing objects (using 'items')
+    if "items" in schema and isinstance(schema["items"], dict) and schema["items"].get("type") == "object":
+        # Ensure array items do not allow dynamic keys before yielding
+        if "properties" in schema["items"] and schema["items"].get("additionalProperties") == False:
+            yield from get_object_paths(schema['items'], parent_path + ("*",))
+
+    # Handle additionalProperties if it's an object and dynamic keys are not allowed
+    if "additionalProperties" in schema and isinstance(schema['additionalProperties'], dict):
+        if schema["additionalProperties"].get("type") == "object" and schema["additionalProperties"].get("additionalProperties") == False:
+            yield parent_path + ("wildpath",)
+            yield from get_object_paths(schema["additionalProperties"], parent_path + ("wildpath",))
+    elif "additionalProperties" in schema and schema["additionalProperties"] == False:
+        yield parent_path
+
+    # Handle allOf, anyOf, oneOf by merging schemas
+    for combiner in ["allOf", "anyOf", "oneOf"]:
+        if combiner in schema:
+            for sub_schema in schema[combiner]:
+                yield from get_object_paths(sub_schema, parent_path)
 
 
 def extract_static_schema_paths(schema, current_path=("$",)):
@@ -420,7 +474,7 @@ def label_paths(df, static_paths):
     """
     Label rows in the DataFrame as:
     - 0 for static paths and their descendants
-    - 1 for the prefix path of static paths containing 'wildpath'
+    - 1 for paths not matching static paths, treating 'wildpath' as a wildcard.
 
     Args:
         df (pd.DataFrame): The DataFrame containing the paths as tuples.
@@ -433,48 +487,67 @@ def label_paths(df, static_paths):
         # Label the static path itself as 0
         df.loc[df["path"] == static_path, "label"] = 0
 
-        # Check if the static path ends with 'wildpath' for labeling its prefix
-        if static_path[-1] == "wildpath":
-            prefix_path = static_path[:-1]
+        # Handle paths containing 'wildpath'
+        for index, row in df.iterrows():
+            row_path = row["path"]
+            
+            # Check if the row path matches static path except for "wildpath"
+            if len(row_path) == len(static_path):
+                match = True
+                for sp, rp in zip(static_path, row_path):
+                    if sp != "wildpath" and sp != rp:
+                        match = False
+                        break
+                if match:
+                    df.at[index, "label"] = 0
 
-            # Label the prefix path as 1 if it exists in the DataFrame
-            if prefix_path in df["path"].values:
-                df.loc[df["path"] == prefix_path, "label"] = 0
-
-            # Label all direct descendants of this prefix path as 0
-            #for index, row in df.iterrows():
-            #    if is_descendant(row["path"], prefix_path):
-            #        df.at[index, "label"] = 0
+    return df
 
 
 def process_dataset(dataset, files_folder):
     """
     Process and extract data from the documents, and return a DataFrame.
-
+    
     Args:
         dataset (str): The name of the dataset file.
         files_folder (str): The folder where the dataset files are stored.
-
+    
     Returns:
         pd.DataFrame or None: A DataFrame for the dataset, or None if no data is processed.
     """
     prefix_paths_dict = defaultdict(set)
     path_types_dict = {}
     parent_frequency_dict = defaultdict(int)
+    
+    total_document_count = 0  
+    matched_document_count = 0 
+    static_schema_count = 0 
 
     # Load and dereference the schema if needed
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
     dereferenced_schema = load_and_dereference_schema(schema_path)
 
     dataset_path = os.path.join(files_folder, dataset)
-    
+
     with open(dataset_path, 'r') as file:
         for line in file:
             doc = json.loads(line)
-            try:                    
-                if match_properties(dereferenced_schema, doc):
-                    process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict)
-                    
+            try: 
+                # Handle both object and array types
+                if isinstance(doc, dict):
+                    total_document_count += 1
+                    # Process a single object
+                    if match_properties(dereferenced_schema, doc):
+                        matched_document_count += 1  # Increment matched document count
+                        process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict)
+                elif isinstance(doc, list):
+                    # Process each object in the array
+                    for item in doc:
+                        total_document_count += 1
+                        if isinstance(item, dict) and match_properties(dereferenced_schema, item):
+                            matched_document_count += 1  # Increment matched document count
+                            process_document(item, prefix_paths_dict, path_types_dict, parent_frequency_dict)
+
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
@@ -484,11 +557,22 @@ def process_dataset(dataset, files_folder):
         return None
     
     df = create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset)
-    #print(f"Extracting static paths from {dataset}.")
-    static_paths = set(extract_static_schema_paths(dereferenced_schema))
-    #print(f"Labeling paths in {dataset}.")
+    static_paths = set(get_object_paths(dereferenced_schema))
+    
+    if len(static_paths) == 0:
+        print(f"No static paths extracted from {dataset}.")
+        return None
+    
+    print(dataset)
+    print(static_paths)
+    print()
     label_paths(df, static_paths)
-        
+
+    static_schema_count += 1
+
+    print(f"Total Documents in {dataset}: {total_document_count}")
+    print(f"Matched Documents in {dataset}: {matched_document_count}")
+
     return df
 
 
@@ -556,8 +640,8 @@ def resample_data(df):
 
     # Create a new DataFrame with the resampled data
     df_resampled = pd.concat([pd.DataFrame(X_resampled, columns=X.columns), pd.DataFrame(y_resampled, columns=["label"])], axis=1)
-    return df_resampled
 
+    return df_resampled
 
 
 def main():
