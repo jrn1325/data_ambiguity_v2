@@ -68,7 +68,7 @@ def has_pattern_properties_string_search(schema):
 
 def prevent_additional_properties(schema):
     """
-    Iteratively enforce "additionalProperties": false in a JSON schema where it is not declared.
+    Recursively enforce "additionalProperties": false in a JSON schema where it is not declared.
     
     Args:
         schema (dict): The JSON schema to enforce the rule on.
@@ -76,42 +76,47 @@ def prevent_additional_properties(schema):
     Returns:
         dict: The modified JSON schema with "additionalProperties" set to false where not declared.
     """
-    stack = [schema]
+    if not isinstance(schema, dict):
+        return schema  # Non-dict schemas are returned as-is
 
-    while stack:
-        current_schema = stack.pop()
+    # If type is object and additionalProperties is not declared, set it to false
+    if schema.get("type") == "object":
+        if "additionalProperties" not in schema:
+            schema["additionalProperties"] = False
+        elif isinstance(schema["additionalProperties"], dict):
+            # If additionalProperties is an object (a schema), process it recursively
+            prevent_additional_properties(schema["additionalProperties"])
 
-        if not isinstance(current_schema, dict):
-            continue
+    # Process nested properties in the current object
+    if "properties" in schema:
+        for prop in schema["properties"].values():
+            prevent_additional_properties(prop)
 
-        # Apply additionalProperties: false if type is object and not declared
-        if current_schema.get("type") == "object":
-            if "additionalProperties" not in current_schema:
-                current_schema["additionalProperties"] = False
-            elif isinstance(current_schema["additionalProperties"], dict):
-                # If additionalProperties is an object (schema), process it as well
-                stack.append(current_schema["additionalProperties"])
+    # Handle array items
+    if schema.get("type") == "array":
+        if "items" in schema:
+            if isinstance(schema["items"], dict):
+                prevent_additional_properties(schema["items"])
+            elif isinstance(schema["items"], list):
+                for item in schema["items"]:
+                    prevent_additional_properties(item)
 
-        # Add nested properties to the stack
-        if "properties" in current_schema:
-            stack.extend(current_schema["properties"].values())
+        # Process prefixItems if present
+        if "prefixItems" in schema:
+            for item in schema["prefixItems"]:
+                prevent_additional_properties(item)
 
-        # Handle array items
-        if current_schema.get("type") == "array" and "items" in current_schema:
-            stack.append(current_schema["items"])
-
-        if "prefixItems" in current_schema:
-            stack.extend(current_schema["prefixItems"])
-
-        # Handle composition keywords like allOf, anyOf, oneOf, etc.
-        for keyword in ["allOf", "anyOf", "oneOf", "not", "then", "else", "if"]:
-            if keyword in current_schema:
-                if isinstance(current_schema[keyword], list):
-                    stack.extend(current_schema[keyword])
-                elif isinstance(current_schema[keyword], dict):
-                    stack.append(current_schema[keyword])
+    # Explore composition keywords and apply recursively
+    for keyword in ["allOf", "anyOf", "oneOf", "not", "then", "else", "if"]:
+        if keyword in schema:
+            if isinstance(schema[keyword], list):
+                for item in schema[keyword]:
+                    prevent_additional_properties(item)
+            elif isinstance(schema[keyword], dict):
+                prevent_additional_properties(schema[keyword])
 
     return schema
+
 
 
 def validate_all_documents(dataset, files_folder, modified_schema):
