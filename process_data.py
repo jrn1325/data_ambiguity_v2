@@ -241,32 +241,32 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
     """
     data = []
 
-    # Get the nested keys and their details under each path
+    # Iterate over the paths and their associated subpaths
     for path, subpaths in prefix_paths_dict.items():
-        schema_info = []  
+        schema_info = {}  # Collect schema information as a dictionary (JSON object)
 
-        # Gather distinct subkeys and their frequencies and types
+        # Iterate over subpaths to gather key details
         for subpath in subpaths:
-            nested_key = subpath[-1]  
+            nested_key = subpath[-1]  # The key at the current path level
             if nested_key in path_types_dict.get(path, {}):
                 nested_key_info = path_types_dict[path][nested_key]
                 frequency = nested_key_info["frequency"]
                 value_type = nested_key_info["type"]
 
-                # Calculate relative frequency
+                # Calculate the relative frequency
                 parent_frequency = parent_frequency_dict.get(path, 1) 
                 relative_frequency = frequency / parent_frequency
 
-                schema_info.append({
-                    "property": nested_key,
+                # Store the key details in the schema dictionary
+                schema_info[nested_key] = {
                     "relative_frequency": relative_frequency,
                     "type": value_type
-                })
+                }
         
-        # Append the path and the schema info to the data list
+        # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
-            "schema": schema_info,
+            "schema": schema_info,  # This is a JSON object, not an array
             "filename": dataset
         })
 
@@ -274,6 +274,7 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
     df = pd.DataFrame(data)
     
     return df
+
 
 
 def get_object_paths(schema, parent_path=("$",)):
@@ -559,9 +560,9 @@ def process_dataset(dataset, files_folder):
     df = create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset)
     static_paths = set(get_object_paths(dereferenced_schema))
     
-    if len(static_paths) == 0:
-        print(f"No static paths extracted from {dataset}.")
-        return None
+    #if len(static_paths) == 0:
+    #    print(f"No static paths extracted from {dataset}.")
+    #    return None
     
     print(dataset)
     print(static_paths)
