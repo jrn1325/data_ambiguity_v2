@@ -1,10 +1,13 @@
+import copy 
 import json
 import jsonref
 import os
 import shutil
 import sys
 import tqdm
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from jsonref import replace_refs
+from jsonschema import RefResolver
 from jsonschema.validators import validator_for
 
 # Use os.path.expanduser to expand '~' to the full home directory path
@@ -12,7 +15,6 @@ SCHEMA_FOLDER = os.path.expanduser("~/Desktop/schemas")
 JSON_FOLDER = os.path.expanduser("~/Desktop/jsons")
 PROCESSED_SCHEMAS_FOLDER = "processed_schemas"
 PROCESSED_JSONS_FOLDER = "processed_jsons"
-
 
 def load_schema(schema_path):
     """
@@ -35,18 +37,34 @@ def load_schema(schema_path):
 
 def load_and_dereference_schema(schema_path):
     """
-    Load the JSON schema from the specified path and dereference any $ref pointers.
+    Load the JSON schema from the specified path and recursively resolve $refs within it.
 
     Args:
         schema_path (str): The path to the JSON schema file.
 
     Returns:
         dict: The dereferenced JSON schema or None.
+        int: Status code indicating success (1) or failure (0).
     """
     try:
         with open(schema_path, 'r') as schema_file:
-            schema = jsonref.load(schema_file)
-            return schema, 1
+            schema = json.load(schema_file)
+
+            if "$ref" in schema:
+                resolved_root = jsonref.JsonRef.replace_refs(schema)
+                # Merge the resolved ref into the schema without discarding other properties
+                partially_resolved_schema = {**resolved_root, **schema}
+                # Remove $ref since it's now replaced with its resolution
+                partially_resolved_schema.pop("$ref", None)
+                resolved_schema = partially_resolved_schema
+            else:
+                resolved_schema = schema
+
+            # Resolve any additional $refs that might exist after the first replacement
+            resolved_schema = jsonref.JsonRef.replace_refs(resolved_schema)
+
+            return resolved_schema, 1
+
     except jsonref.JsonRefError as e:
         print(f"Error dereferencing schema {schema_path}: {e}")
         return None, 0
@@ -56,6 +74,7 @@ def load_and_dereference_schema(schema_path):
     except Exception as e:
         print(f"Unknown error dereferencing schema {schema_path}: {e}")
         return None, 0
+
     
     
 def has_pattern_properties_string_search(schema):
@@ -74,52 +93,48 @@ def has_pattern_properties_string_search(schema):
 
 def prevent_additional_properties(schema):
     """
-    Recursively enforce "additionalProperties": false in a JSON schema where it is not declared.
-    
+    Recursively traverse the schema and set 'additionalProperties' to False
+    if it is not explicitly declared.
+
     Args:
         schema (dict): The JSON schema to enforce the rule on.
-        
+
     Returns:
-        dict: The modified JSON schema with "additionalProperties" set to false where not declared.
+        dict: The schema with 'additionalProperties' set to False where it's not declared.
     """
     if not isinstance(schema, dict):
-        return schema  # Non-dict schemas are returned as-is
+        return schema
 
-    # If type is object and additionalProperties is not declared, set it to false
-    if schema.get("type") == "object":
-        if "additionalProperties" not in schema:
-            schema["additionalProperties"] = False
-        elif isinstance(schema["additionalProperties"], dict):
-            # If additionalProperties is an object (a schema), process it recursively
-            prevent_additional_properties(schema["additionalProperties"])
+    # If 'additionalProperties' is not declared, set it to False
+    if "additionalProperties" not in schema:
+        schema["additionalProperties"] = False
+    elif isinstance(schema["additionalProperties"], dict):
+        prevent_additional_properties(schema["additionalProperties"])
 
-    # Process nested properties in the current object
+    # Recursively handle 'properties'
     if "properties" in schema:
-        for prop in schema["properties"].values():
-            prevent_additional_properties(prop)
+        for value in schema["properties"].values():
+            if isinstance(value, dict):
+                prevent_additional_properties(value)
 
-    # Handle array items
-    if schema.get("type") == "array":
-        if "items" in schema:
-            if isinstance(schema["items"], dict):
-                prevent_additional_properties(schema["items"])
-            elif isinstance(schema["items"], list):
-                for item in schema["items"]:
+    # Recursively handle 'items' (for arrays)
+    if "items" in schema:
+        if isinstance(schema["items"], dict):
+            prevent_additional_properties(schema["items"])
+        elif isinstance(schema["items"], list):
+            for item in schema["items"]:
+                if isinstance(item, dict):
                     prevent_additional_properties(item)
 
-        # Process prefixItems if present
-        if "prefixItems" in schema:
-            for item in schema["prefixItems"]:
-                prevent_additional_properties(item)
-
-    # Explore composition keywords and apply recursively
-    for keyword in ["allOf", "anyOf", "oneOf", "not", "then", "else", "if"]:
+    # Handle complex schema keywords
+    for keyword in ["allOf", "anyOf", "oneOf", "not", "if", "then", "else"]:
         if keyword in schema:
-            if isinstance(schema[keyword], list):
-                for item in schema[keyword]:
-                    prevent_additional_properties(item)
-            elif isinstance(schema[keyword], dict):
+            if isinstance(schema[keyword], dict):
                 prevent_additional_properties(schema[keyword])
+            elif isinstance(schema[keyword], list):
+                for subschema in schema[keyword]:
+                    if isinstance(subschema, dict):
+                        prevent_additional_properties(subschema)
 
     return schema
 
@@ -135,15 +150,13 @@ def validate_all_documents(dataset, files_folder, modified_schema):
         modified_schema (dict): The modified schema to validate against.
 
     Returns:
-        tuple: (all_docs, invalid_docs, all_valid) where:
+        tuple: (all_docs, invalid_docs) where:
                - all_docs (list): List of all documents (valid or invalid).
                - invalid_docs (list): List of invalid documents.
-               - all_valid (bool): True if all documents are valid, False if any validation fails.
     """
     dataset_path = os.path.join(files_folder, dataset)
     all_docs = []
     invalid_docs = []
-    all_valid = True
 
     try:
         cls = validator_for(modified_schema)
@@ -163,17 +176,15 @@ def validate_all_documents(dataset, files_folder, modified_schema):
                     # If there are validation errors, add to invalid_docs and set all_valid to False
                     if errors:
                         invalid_docs.append(doc)
-                        all_valid = False
 
                 except json.JSONDecodeError as e:
                     print(f"Error parsing JSON document in {dataset}: {e}")
-                    all_valid = False
                     continue
     except Exception as e:
         print(f"Error reading dataset {dataset_path}: {e}")
-        return [], [], False
+        return [], []
 
-    return all_docs, invalid_docs, all_valid
+    return all_docs, invalid_docs
 
 
 def recreate_directory(directory_path):
@@ -233,11 +244,10 @@ def process_single_dataset(dataset, files_folder):
     if has_pattern_properties_string_search(schema):
         print(f"Skipping {dataset} due to patternProperties in the schema.")
         return (0, 0, 1)
-
+    
     # Load and dereference the schema if needed
     dereferenced_schema, dereferenced_flag = load_and_dereference_schema(schema_path)
- 
-
+    
     # If dereferencing fails, return the appropriate flags
     if dereferenced_schema is None:
         print(f"Skipping {dataset} due to schema dereferencing failure.")
@@ -249,21 +259,21 @@ def process_single_dataset(dataset, files_folder):
         modified_flag = 1
     except Exception as e:
         print(f"Error modifying schema for {dataset}: {e}")
-        modified_schema = dereferenced_schema
+        modified_schema = copy.deepcopy(dereferenced_schema)
         modified_flag = 0
     
     # Validate all documents against the modified schema
-    all_docs, invalid_docs, all_valid = validate_all_documents(dataset, files_folder, modified_schema)
+    all_docs, invalid_docs = validate_all_documents(dataset, files_folder, modified_schema)
     print(f"Total number of documents in {dataset} is {len(all_docs)}")
     print(f"Number of invalid documents in {dataset} is {len(invalid_docs)}")
 
-    if all_valid:
-        print(f"All documents in {dataset} passed validation with modified schema.")
-        schema_to_use = modified_schema
-    else:
+    if invalid_docs:
         print(f"Validation failed for at least one document in {dataset}, reverting to original schema.")
-        schema_to_use = dereferenced_schema
-
+        schema_to_use = copy.deepcopy(modified_schema)
+    else:
+        print(f"All documents in {dataset} passed validation with modified schema.")
+        schema_to_use = copy.deepcopy(modified_schema)
+        
     if not all_docs:
         print(f"No valid documents found in {dataset}. Skipping schema and JSON creation.")
         return (dereferenced_flag, modified_flag, 0)
@@ -274,12 +284,10 @@ def process_single_dataset(dataset, files_folder):
 
     # Save JSON Lines file with the same name as the schema
     json_save_path = os.path.join(PROCESSED_JSONS_FOLDER, dataset)
-    save_json_lines(valid_docs, json_save_path)
+    save_json_lines(all_docs, json_save_path)
 
     return (dereferenced_flag, modified_flag, 0)  # Return success flags and patternProperties flag
 
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def process_datasets():
     """
@@ -296,7 +304,14 @@ def process_datasets():
     dereference_count = 0
     modify_count = 0
     pattern_properties_count = 0
-
+    '''
+    for dataset in datasets:
+        if dataset != "sourcery.json":
+            continue
+        print(f"Processing dataset {dataset}...")
+        process_single_dataset(dataset, JSON_FOLDER)
+    sys.exit(0)
+    '''
     with ProcessPoolExecutor() as executor:
         future_to_dataset = {executor.submit(process_single_dataset, dataset, JSON_FOLDER): dataset for dataset in datasets}
         
