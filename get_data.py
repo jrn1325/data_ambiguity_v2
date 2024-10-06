@@ -75,8 +75,7 @@ def load_and_dereference_schema(schema_path):
         print(f"Unknown error dereferencing schema {schema_path}: {e}")
         return None, 0
 
-    
-    
+        
 def has_pattern_properties_string_search(schema):
     """
     Checks if 'patternProperties' exists in the schema by converting it to a string.
@@ -94,7 +93,7 @@ def has_pattern_properties_string_search(schema):
 def prevent_additional_properties(schema):
     """
     Recursively traverse the schema and set 'additionalProperties' to False
-    if it is not explicitly declared.
+    if it is not explicitly declared, focusing on object-like structures.
 
     Args:
         schema (dict): The JSON schema to enforce the rule on.
@@ -105,19 +104,19 @@ def prevent_additional_properties(schema):
     if not isinstance(schema, dict):
         return schema
 
-    # If 'additionalProperties' is not declared, set it to False
-    if "additionalProperties" not in schema:
+    # Treat the schema as an object if 'type' is 'object' or if 'properties' exist
+    if (schema.get("type") == "object" or "properties" in schema) and "additionalProperties" not in schema:
         schema["additionalProperties"] = False
-    elif isinstance(schema["additionalProperties"], dict):
+    elif isinstance(schema.get("additionalProperties"), dict):
         prevent_additional_properties(schema["additionalProperties"])
 
-    # Recursively handle 'properties'
+    # Recursively handle 'properties' for object-like schemas
     if "properties" in schema:
         for value in schema["properties"].values():
             if isinstance(value, dict):
                 prevent_additional_properties(value)
 
-    # Recursively handle 'items' (for arrays)
+    # Recursively handle 'items' for array types
     if "items" in schema:
         if isinstance(schema["items"], dict):
             prevent_additional_properties(schema["items"])
@@ -167,12 +166,11 @@ def validate_all_documents(dataset, files_folder, modified_schema):
         with open(dataset_path, 'r') as file:
             for line in file:
                 try:
-                    doc = json.loads(line)
+                    doc = json.loads(line)                    
                     all_docs.append(doc)
 
-                    # Validate the document
+                    # Validate the document against the modified schema
                     errors = sorted(validator.iter_errors(doc), key=lambda e: e.path)
-
                     # If there are validation errors, add to invalid_docs and set all_valid to False
                     if errors:
                         invalid_docs.append(doc)

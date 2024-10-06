@@ -8,7 +8,9 @@ import sys
 import tqdm
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from imblearn.over_sampling import RandomOverSampler
+from imblearn.over_sampling import RandomOverSampler, SMOTE
+from imblearn.under_sampling import RandomUnderSampler  # For undersampling
+from imblearn.combine import SMOTEENN, SMOTETomek  # For combining over- and under-sampling
 from sklearn.model_selection import GroupShuffleSplit
 
 import warnings
@@ -49,71 +51,26 @@ def split_data(train_ratio=0.8, random_value=101):
     test_set = [schemas[i] for i in test_idx]
 
     return train_set, test_set
+    
 
-
-def load_and_dereference_schema(schema_path):
+def load_schema(schema_path):
     """
-    Load the JSON schema from the specified path and dereference any $ref pointers.
+    Load the schema from the path.
 
     Args:
         schema_path (str): The path to the JSON schema file.
 
     Returns:
-        dict: The dereferenced JSON schema or None.
+        dict or None: The loaded schema, or None if loading fails.
     """
     try:
         with open(schema_path, 'r') as schema_file:
-            schema = jsonref.load(schema_file)
+            schema = json.load(schema_file)
             return schema
     except Exception as e:
         print(f"Error loading schema {schema_path}: {e}")
         return None
     
-
-def prevent_additional_properties(schema):
-    """
-    Iteratively traverse the schema and set 'additionalProperties' to False
-    if it is not explicitly declared.
-
-    Args:
-        schema (dict): The JSON schema to enforce the rule on.
-
-    Returns:
-        dict: The schema with 'additionalProperties' set to False where it's not declared.
-    """
-    if not isinstance(schema, dict):
-        return schema
-
-    # Initialize the stack with the root schema
-    stack = [schema]
-
-    while stack:
-        current_schema = stack.pop()
-
-        if not isinstance(current_schema, dict):
-            continue
-
-        # Set 'additionalProperties' to False if not declared
-        if "additionalProperties" not in current_schema:
-            current_schema["additionalProperties"] = False
-
-        # If 'properties' exists, push its values onto the stack
-        if "properties" in current_schema:
-            for value in current_schema["properties"].values():
-                if isinstance(value, dict):
-                    stack.append(value)
-
-        # Handle nested schemas under 'items' for arrays
-        if "items" in current_schema:
-            if isinstance(current_schema["items"], dict):
-                stack.append(current_schema["items"])
-            elif isinstance(current_schema["items"], list):
-                for item in current_schema["items"]:
-                    if isinstance(item, dict):
-                        stack.append(item)
-
-    return schema
-
 
 def extract_paths(doc, path = ("$",), values = []):
     """Get the path of each key and its value from the json documents.
@@ -180,6 +137,32 @@ def match_properties(schema, document):
     return False
 
 
+def get_json_format(value):
+    """
+    Determine the JSON format type based on the input value's type.
+
+    Args:
+        value: The value to check.
+
+    Returns:
+        str: The corresponding JSON format type.
+    """
+    # Mapping from Python types to JSON types
+    python_to_json_type = {
+        "str": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+        "list": "array",
+        "dict": "object",
+        "NoneType": "null"
+    }
+
+    # Get the value's type name and map it to the JSON format type
+    value_type = type(value).__name__
+    return python_to_json_type.get(value_type, "unknown") 
+
+
 def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict):
     """
     Extracts paths from the given JSON document and stores them in dictionaries,
@@ -210,7 +193,7 @@ def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_d
                 path_types_dict[prefix] = {}
 
             # Get the type of the current value
-            value_type = type(value).__name__
+            value_type = get_json_format(value)
 
             # Update the frequency count for the nested key
             
@@ -254,7 +237,7 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
                 value_type = nested_key_info["type"]
 
                 # Calculate the relative frequency
-                parent_frequency = parent_frequency_dict.get(path, 1) 
+                parent_frequency = parent_frequency_dict.get(path, 1)
                 relative_frequency = frequency / parent_frequency
 
                 # Store the key details in the schema dictionary
@@ -262,7 +245,10 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
                     "relative_frequency": relative_frequency,
                     "type": value_type
                 }
-        
+
+        # Add the parent path length to the schema info
+        schema_info["nesting_depth"] = len(path)
+
         # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
@@ -272,54 +258,52 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
 
     # Create the DataFrame from the data list
     df = pd.DataFrame(data)
-    
-    return df
 
+    return df
 
 
 def get_object_paths(schema, parent_path=("$",)):
     """
     Recursively traverse a JSON schema and collect full paths of properties where type is 'object',
     returning the paths as tuples and excluding paths for dynamic nested keys.
-    
-    :param schema: The JSON schema (dict)
-    :param parent_path: The current path accumulated as a tuple (default is the root)
-    :return: A generator yielding full paths of object-type properties as tuples
+
+    Args:
+    schema (dict): The JSON schema.
+    parent_path (tuple): The current path accumulated as a tuple (default is the root).
+
+    Returns:
+        A generator yielding full paths of object-type properties as tuples
     """
     
     # Check if 'properties' exist in the schema
     if "properties" in schema:
         for prop, prop_schema in schema["properties"].items():
-            # Construct the full path as a tuple
             full_path = parent_path + (prop,)
-            
-            # Ensure prop_schema is a dictionary
+
             if isinstance(prop_schema, dict):
-                if prop_schema.get("type") == "object":
-                    # Ensure nested properties are well-defined, and dynamic keys are not allowed
-                    if 'properties' in prop_schema:
-                        # Only yield if additionalProperties is explicitly set to False
-                        if prop_schema.get("additionalProperties") == False:
-                            yield full_path
-                            yield from get_object_paths(prop_schema, full_path)
-                    # If no properties are defined, also ensure additionalProperties is False
-                    elif prop_schema.get("additionalProperties") == False:
-                        yield full_path
-                        yield from get_object_paths(prop_schema, full_path)
+                # Only yield the path if additionalProperties is explicitly set to False
+                if prop_schema.get("additionalProperties") == False:
+                    yield full_path  # Yield the path for well-defined properties only
+                
+                # Recursively check nested properties
+                yield from get_object_paths(prop_schema, full_path)
 
-    # Handle arrays containing objects (using 'items')
-    if "items" in schema and isinstance(schema["items"], dict) and schema["items"].get("type") == "object":
-        # Ensure array items do not allow dynamic keys before yielding
-        if "properties" in schema["items"] and schema["items"].get("additionalProperties") == False:
-            yield from get_object_paths(schema['items'], parent_path + ("*",))
+    # Handle arrays containing objects
+    if "items" in schema and isinstance(schema["items"], dict):
+        if schema["items"].get("type") == "object":
+            if schema["items"].get("additionalProperties") == False:
+                yield from get_object_paths(schema["items"], parent_path + ("*",))
 
-    # Handle additionalProperties if it's an object and dynamic keys are not allowed
-    if "additionalProperties" in schema and isinstance(schema['additionalProperties'], dict):
-        if schema["additionalProperties"].get("type") == "object" and schema["additionalProperties"].get("additionalProperties") == False:
-            yield parent_path + ("wildpath",)
-            yield from get_object_paths(schema["additionalProperties"], parent_path + ("wildpath",))
-    elif "additionalProperties" in schema and schema["additionalProperties"] == False:
-        yield parent_path
+    # Handle additionalProperties if it's a schema (a dict)
+    if "additionalProperties" in schema:
+        if isinstance(schema["additionalProperties"], dict):
+            # We only want to traverse if additionalProperties is a schema
+            if schema["additionalProperties"].get("additionalProperties") == False:
+                yield from get_object_paths(schema["additionalProperties"], parent_path + ("wildpath",))
+
+        # If additionalProperties is explicitly False, yield the path
+        elif schema["additionalProperties"] == False:
+            yield parent_path
 
     # Handle allOf, anyOf, oneOf by merging schemas
     for combiner in ["allOf", "anyOf", "oneOf"]:
@@ -427,35 +411,6 @@ def extract_implicit_schema_paths(schema, current_path=("$",)):
         yield from extract_implicit_schema_paths(schema["then"], current_path)
   
 
-def compare_tuples(tuple1, tuple2):
-    """
-    Compare two tuples element-wise, allowing for regular expression matching on elements in tuple2.
-    If item2 is a valid regex pattern (string), it tries to match item1 with item2 as a regex.
-    Otherwise, it performs direct equality comparison.
-
-    Args:
-        tuple1 (tuple): The first tuple, contains actual values.
-        tuple2 (tuple): The second tuple, which may contain regex patterns or direct values.
-
-    Returns:
-        bool: True if tuples are considered equal, False otherwise.
-    """
-    if len(tuple1) != len(tuple2):
-        return False
-
-    for item1, item2 in zip(tuple1, tuple2):
-        if isinstance(item2, str):
-            try:
-                pattern = re.compile(item2)
-                if pattern.fullmatch(item1):
-                    continue
-            except re.error:
-                pass
-        if item1 != item2:
-            return False 
-    return True
-
-
 def is_descendant(path, prefix_path):
     """
     Check if a given path is a direct descendant of a prefix path.
@@ -469,6 +424,44 @@ def is_descendant(path, prefix_path):
     """
     # Check if the path starts with the prefix path and has exactly one additional element
     return path[:len(prefix_path)] == prefix_path and len(path) == len(prefix_path) + 1
+
+
+def compare_tuples(tuple1, tuple2):
+    """
+    Compare two tuples element-wise, allowing for regular expression matching on elements in tuple2.
+    If item2 is a valid regex pattern (string), it tries to match item1 with item2 as a regex.
+    The 'wildpath' keyword in tuple2 matches any corresponding element in tuple1.
+    
+    Args:
+        tuple1 (tuple): The first tuple, contains actual values.
+        tuple2 (tuple): The second tuple, which may contain regex patterns, 'wildpath', or direct values.
+
+    Returns:
+        bool: True if tuples are considered equal, False otherwise.
+    """
+    if len(tuple1) != len(tuple2):
+        return False
+
+    for item1, item2 in zip(tuple1, tuple2):
+        # Handle 'wildpath': It can match any value in tuple1
+        if item2 == "wildpath":
+            continue
+        
+        # Handle regex matching
+        if isinstance(item2, str):
+            try:
+                # Try to compile and match item2 as a regex pattern
+                pattern = re.compile(item2)
+                if pattern.fullmatch(item1):
+                    continue
+            except re.error:
+                pass  # If item2 is not a valid regex, treat it as a normal string
+        
+        # Direct comparison if not wildpath or regex match
+        if item1 != item2:
+            return False 
+
+    return True 
 
 
 def label_paths(df, static_paths):
@@ -524,9 +517,9 @@ def process_dataset(dataset, files_folder):
     matched_document_count = 0 
     static_schema_count = 0 
 
-    # Load and dereference the schema if needed
+    # Load the schema
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
-    dereferenced_schema = load_and_dereference_schema(schema_path)
+    schema = load_schema(schema_path)
 
     dataset_path = os.path.join(files_folder, dataset)
 
@@ -534,21 +527,17 @@ def process_dataset(dataset, files_folder):
         for line in file:
             doc = json.loads(line)
             try: 
-                # Handle both object and array types
                 if isinstance(doc, dict):
                     total_document_count += 1
-                    # Process a single object
-                    if match_properties(dereferenced_schema, doc):
-                        matched_document_count += 1  # Increment matched document count
+                    if match_properties(schema, doc):
+                        matched_document_count += 1 
                         process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict)
                 elif isinstance(doc, list):
-                    # Process each object in the array
                     for item in doc:
                         total_document_count += 1
-                        if isinstance(item, dict) and match_properties(dereferenced_schema, item):
-                            matched_document_count += 1  # Increment matched document count
+                        if isinstance(item, dict) and match_properties(schema, item):
+                            matched_document_count += 1 
                             process_document(item, prefix_paths_dict, path_types_dict, parent_frequency_dict)
-
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
@@ -558,11 +547,11 @@ def process_dataset(dataset, files_folder):
         return None
     
     df = create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset)
-    static_paths = set(get_object_paths(dereferenced_schema))
+    static_paths = set(get_object_paths(schema))
     
-    #if len(static_paths) == 0:
-    #    print(f"No static paths extracted from {dataset}.")
-    #    return None
+    if len(static_paths) == 0:
+        print(f"No static paths extracted from {dataset}.")
+        return None
     
     print(dataset)
     print(static_paths)
@@ -592,9 +581,10 @@ def preprocess_data(schema_list, files_folder):
 
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
+    
     '''
     for i, dataset in enumerate(datasets):
-        if dataset != "ansible-meta-runtime.json":#ecosystem-json.json":
+        if dataset != "dotnetcli-host-json.json":#ecosystem-json.json":
             continue
         df = process_dataset(dataset, files_folder)
         sys.exit(0)
