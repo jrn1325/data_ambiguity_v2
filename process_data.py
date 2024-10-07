@@ -1,5 +1,6 @@
 import json
 import jsonref
+import math
 import numpy as np
 import os
 import pandas as pd
@@ -8,21 +9,18 @@ import sys
 import tqdm
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from imblearn.over_sampling import RandomOverSampler, SMOTE
-from imblearn.under_sampling import RandomUnderSampler  # For undersampling
-from imblearn.combine import SMOTEENN, SMOTETomek  # For combining over- and under-sampling
+from imblearn.over_sampling import RandomOverSampler
 from sklearn.model_selection import GroupShuffleSplit
 
 import warnings
 warnings.filterwarnings("ignore")
 
 # Create constant variables
-SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
-
-# Use os.path.expanduser to expand '~' to the full home directory path
-SCHEMA_FOLDER = "processed_schemas"
 JSON_FOLDER = "processed_jsons"
+SCHEMA_FOLDER = "processed_schemas"
+SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
+
 
 
 def split_data(train_ratio=0.8, random_value=101):
@@ -163,16 +161,13 @@ def get_json_format(value):
     return python_to_json_type.get(value_type, "unknown") 
 
 
-def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict):
+def process_document(doc, path_types_dict, parent_frequency_dict):
     """
     Extracts paths from the given JSON document and stores them in dictionaries,
     grouping paths that share the same prefix and capturing the frequency and data type of nested keys.
 
     Args:
         doc (dict): The JSON document from which paths are extracted.
-        prefix_paths_dict (dict): A dictionary where the keys are path prefixes 
-                                  (tuples of path segments, excluding the last segment),
-                                  and the values are sets of full paths that share the same prefix.
         path_types_dict (dict): A dictionary where the keys are path prefixes and 
                                 the values are dictionaries with nested key information 
                                 (frequency and data type).
@@ -185,8 +180,6 @@ def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_d
             if nested_key == "*":
                 continue
             prefix = path[:-1]
-            # Add the path to the prefix_paths_dict
-            prefix_paths_dict[prefix].add(path)
 
             # Initialize or update the frequency and type information
             if prefix not in path_types_dict:
@@ -209,42 +202,44 @@ def process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_d
                 parent_frequency_dict[prefix] = 1
 
 
-def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset):
+def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
     """
-    Create a DataFrame from dictionaries containing path types and path prefixes.
+    Create a DataFrame from dictionaries containing path and their nested key information.
 
     Args:
-        prefix_paths_dict (dict): A dictionary where keys are path prefixes and values are sets of paths.
         path_types_dict (dict): A dictionary containing frequency and type information for each nested key's value.
         parent_frequency_dict (dict): A dictionary with the frequency of parent keys.
         dataset (str): The name of the dataset.
+        num_docs (int): The number of documents in the dataset.
 
     Returns:
         pd.DataFrame: A DataFrame with 'path', 'schema', and 'filename' columns.
     """
     data = []
 
-    # Iterate over the paths and their associated subpaths
-    for path, subpaths in prefix_paths_dict.items():
-        schema_info = {}  # Collect schema information as a dictionary (JSON object)
+    # Iterate over the paths and their associated nested keys
+    for path, nested_keys in path_types_dict.items():
+        schema_info = {}  
+   
+        values_types = set()
+        frequencies = []
 
         # Iterate over subpaths to gather key details
-        for subpath in subpaths:
-            nested_key = subpath[-1]  # The key at the current path level
-            if nested_key in path_types_dict.get(path, {}):
-                nested_key_info = path_types_dict[path][nested_key]
-                frequency = nested_key_info["frequency"]
-                value_type = nested_key_info["type"]
+        for nested_key, nested_key_info in nested_keys.items():
+            frequency = nested_key_info["frequency"]
+            value_type = nested_key_info["type"]
+            values_types.add(value_type)
+            frequencies.append(frequency)
 
-                # Calculate the relative frequency
-                parent_frequency = parent_frequency_dict.get(path, 1)
-                relative_frequency = frequency / parent_frequency
+            # Calculate the relative frequency
+            parent_frequency = parent_frequency_dict.get(path, 1)
+            relative_frequency = frequency / parent_frequency
 
-                # Store the key details in the schema dictionary
-                schema_info[nested_key] = {
-                    "relative_frequency": relative_frequency,
-                    "type": value_type
-                }
+            # Store the key details in the schema dictionary
+            schema_info[nested_key] = {
+                "relative_frequency": relative_frequency,
+                "type": value_type
+            }
 
         # Add the parent path length to the schema info
         schema_info["nesting_depth"] = len(path)
@@ -252,7 +247,9 @@ def create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, 
         # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
-            "schema": schema_info,  # This is a JSON object, not an array
+            "schema": schema_info,
+            "datatype_entropy": 0 if len(values_types) == 1 else 1,
+            "key_entropy": -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies),
             "filename": dataset
         })
 
@@ -509,11 +506,10 @@ def process_dataset(dataset, files_folder):
     Returns:
         pd.DataFrame or None: A DataFrame for the dataset, or None if no data is processed.
     """
-    prefix_paths_dict = defaultdict(set)
     path_types_dict = {}
     parent_frequency_dict = defaultdict(int)
     
-    total_document_count = 0  
+    num_docs = 0  
     matched_document_count = 0 
     static_schema_count = 0 
 
@@ -528,25 +524,27 @@ def process_dataset(dataset, files_folder):
             doc = json.loads(line)
             try: 
                 if isinstance(doc, dict):
-                    total_document_count += 1
+                    num_docs += 1
                     if match_properties(schema, doc):
                         matched_document_count += 1 
-                        process_document(doc, prefix_paths_dict, path_types_dict, parent_frequency_dict)
+                        process_document(doc, path_types_dict, parent_frequency_dict)
+                        num_docs += 1
                 elif isinstance(doc, list):
                     for item in doc:
-                        total_document_count += 1
+                        num_docs += 1
                         if isinstance(item, dict) and match_properties(schema, item):
                             matched_document_count += 1 
-                            process_document(item, prefix_paths_dict, path_types_dict, parent_frequency_dict)
+                            process_document(item, path_types_dict, parent_frequency_dict)
+                            num_docs += 1
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
 
-    if len(prefix_paths_dict) == 0:
+    if len(path_types_dict) == 0:
         print(f"No paths extracted from {dataset}.")
         return None
     
-    df = create_dataframe(prefix_paths_dict, path_types_dict, parent_frequency_dict, dataset)
+    df = create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs)
     static_paths = set(get_object_paths(schema))
     
     if len(static_paths) == 0:
@@ -560,7 +558,7 @@ def process_dataset(dataset, files_folder):
 
     static_schema_count += 1
 
-    print(f"Total Documents in {dataset}: {total_document_count}")
+    print(f"Total Documents in {dataset}: {num_docs}")
     print(f"Matched Documents in {dataset}: {matched_document_count}")
 
     return df
