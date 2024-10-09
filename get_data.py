@@ -1,4 +1,3 @@
-import copy 
 import json
 import jsonref
 import os
@@ -6,6 +5,7 @@ import shutil
 import sys
 import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import copy, deepcopy
 from jsonref import replace_refs
 from jsonschema import RefResolver
 from jsonschema.validators import validator_for
@@ -257,7 +257,7 @@ def process_single_dataset(dataset, files_folder):
         modified_flag = 1
     except Exception as e:
         print(f"Error modifying schema for {dataset}: {e}")
-        modified_schema = copy.deepcopy(dereferenced_schema)
+        modified_schema = deepcopy(dereferenced_schema)
         modified_flag = 0
     
     # Validate all documents against the modified schema
@@ -267,10 +267,10 @@ def process_single_dataset(dataset, files_folder):
 
     if invalid_docs:
         print(f"Validation failed for at least one document in {dataset}, reverting to original schema.")
-        schema_to_use = copy.deepcopy(modified_schema)
+        schema_to_use = deepcopy(modified_schema)
     else:
         print(f"All documents in {dataset} passed validation with modified schema.")
-        schema_to_use = copy.deepcopy(modified_schema)
+        schema_to_use = deepcopy(modified_schema)
         
     if not all_docs:
         print(f"No valid documents found in {dataset}. Skipping schema and JSON creation.")

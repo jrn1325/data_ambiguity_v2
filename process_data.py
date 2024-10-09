@@ -219,7 +219,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
 
     # Iterate over the paths and their associated nested keys
     for path, nested_keys in path_types_dict.items():
-        schema_info = {}  
+        schema_info = {"properties": {}}
    
         values_types = set()
         frequencies = []
@@ -236,7 +236,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
             relative_frequency = frequency / parent_frequency
 
             # Store the key details in the schema dictionary
-            schema_info[nested_key] = {
+            schema_info["properties"][nested_key] = {
                 "relative_frequency": relative_frequency,
                 "type": value_type
             }
@@ -244,12 +244,16 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
         # Add the parent path length to the schema info
         schema_info["nesting_depth"] = len(path)
 
+        # Calculate datatype and key entropy
+        datatype_entropy = 0 if len(values_types) == 1 else 1
+        key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
+
         # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
             "schema": schema_info,
-            "datatype_entropy": 0 if len(values_types) == 1 else 1,
-            "key_entropy": -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies),
+            "datatype_entropy": datatype_entropy,
+            "key_entropy": key_entropy,
             "filename": dataset
         })
 
@@ -555,7 +559,7 @@ def process_dataset(dataset, files_folder):
     print(static_paths)
     print()
     label_paths(df, static_paths)
-
+    
     static_schema_count += 1
 
     print(f"Total Documents in {dataset}: {num_docs}")
