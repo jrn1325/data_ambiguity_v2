@@ -189,7 +189,6 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
             value_type = get_json_format(value)
 
             # Update the frequency count for the nested key
-            
             if nested_key in path_types_dict[prefix]:
                 path_types_dict[prefix][nested_key]["frequency"] += 1
             else:
@@ -244,9 +243,15 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
         # Add the parent path length to the schema info
         schema_info["nesting_depth"] = len(path)
 
-        # Calculate datatype and key entropy
-        datatype_entropy = 0 if len(values_types) == 1 else 1
-        key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
+        # Calculate datatype entropy (based on type diversity)
+        datatype_entropy = 0 if len(values_types) == 1 else 1 
+
+        # Calculate key entropy (based on relative frequencies of keys)
+        key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies if freq > 0)
+
+        # Add entropies to the schema info at the same level as "properties"
+        #schema_info["datatype_entropy"] = datatype_entropy
+        #schema_info["key_entropy"] = key_entropy
 
         # Append a JSON object (dictionary) for this path
         data.append({

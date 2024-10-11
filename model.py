@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 # Create constant variables
 SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
-BATCH_SIZE = 100
+BATCH_SIZE = 120
 MAX_TOKEN_LEN = 512
 ADAPTER_NAME = "data_ambiguity"
 MODEL_NAME = "microsoft/codebert-base"
