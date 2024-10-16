@@ -5,9 +5,6 @@ import shutil
 import sys
 import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from copy import copy, deepcopy
-from jsonref import replace_refs
-from jsonschema import RefResolver
 from jsonschema.validators import validator_for
 
 # Use os.path.expanduser to expand '~' to the full home directory path
@@ -44,7 +41,6 @@ def load_and_dereference_schema(schema_path):
 
     Returns:
         dict: The dereferenced JSON schema or None.
-        int: Status code indicating success (1) or failure (0).
     """
     try:
         with open(schema_path, 'r') as schema_file:
@@ -63,17 +59,17 @@ def load_and_dereference_schema(schema_path):
             # Resolve any additional $refs that might exist after the first replacement
             resolved_schema = jsonref.JsonRef.replace_refs(resolved_schema)
 
-            return resolved_schema, 1
+            return resolved_schema
 
     except jsonref.JsonRefError as e:
         print(f"Error dereferencing schema {schema_path}: {e}")
-        return None, 0
+        return None
     except ValueError as e:
         print(f"Error parsing schema {schema_path}: {e}")
-        return None, 0
+        return None
     except Exception as e:
         print(f"Unknown error dereferencing schema {schema_path}: {e}")
-        return None, 0
+        return None
 
         
 def has_pattern_properties_string_search(schema):
@@ -138,14 +134,13 @@ def prevent_additional_properties(schema):
     return schema
 
 
-def validate_all_documents(dataset, files_folder, modified_schema):
+def validate_all_documents(dataset_path, modified_schema):
     """
     Validate all documents in the dataset against the modified schema.
     Return the list of all documents and a flag indicating whether all documents are valid.
 
     Args:
-        dataset (str): The name of the dataset file.
-        files_folder (str): The folder where the dataset files are stored.
+        dataset_path (path): The path of the dataset file.
         modified_schema (dict): The modified schema to validate against.
 
     Returns:
@@ -153,7 +148,6 @@ def validate_all_documents(dataset, files_folder, modified_schema):
                - all_docs (list): List of all documents (valid or invalid).
                - invalid_docs (list): List of invalid documents.
     """
-    dataset_path = os.path.join(files_folder, dataset)
     all_docs = []
     invalid_docs = []
 
@@ -176,7 +170,7 @@ def validate_all_documents(dataset, files_folder, modified_schema):
                         invalid_docs.append(doc)
 
                 except json.JSONDecodeError as e:
-                    print(f"Error parsing JSON document in {dataset}: {e}")
+                    print(f"Error parsing JSON document in {dataset_path}: {e}")
                     continue
     except Exception as e:
         print(f"Error reading dataset {dataset_path}: {e}")
@@ -219,113 +213,157 @@ def save_json_lines(json_docs, path):
             f.write(json.dumps(doc) + '\n')
 
 
-def process_single_dataset(dataset, files_folder):
+def process_single_dataset(dataset):
     """
-    Process a single dataset to create and label a DataFrame.
+    Process a single dataset.
     Also save the resulting schema and JSON files in processed folders.
 
     Args:
         dataset (str): The name of the dataset file.
-        files_folder (str): The folder where the dataset files are stored.
 
     Returns:
-        tuple: (1 if schema was dereferenced, 1 if schema was modified, 1 if schema has patternProperties) otherwise 0s.
+        dict: A dictionary of flags tracking failures with keys:
+            - dereferenced: 1 if the schema failed to dereference, else 0
+            - modified: 1 if the schema failed to be modified, else 0
+            - pattern_properties: 1 if the schema has patternProperties, else 0
+            - empty: 1 if the dataset is empty, else 0
+            - exist: 1 if the dataset was skipped due to not existing, else 0
+            - loaded: 1 if the schema failed to load, else 0
     """
+    # Initialize failure flags
+    failure_flags = {
+        "exist": 0,
+        "empty": 0,
+        "loaded": 0,
+        "pattern_properties": 0,
+        "dereferenced": 0,
+        "modified": 0 
+    }
+    
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
+    dataset_path = os.path.join(JSON_FOLDER, dataset)
+
+    # Check if the dataset exists
+    if not os.path.exists(dataset_path):
+        print(f"Dataset {dataset} does not exist in {JSON_FOLDER}. Skipping...")
+        failure_flags["exist"] = 1  # Mark failure if dataset does not exist
+        return failure_flags
+    
+    # Check if the dataset is empty
+    if os.stat(dataset_path).st_size == 0:
+        print(f"Dataset {dataset} is empty. Skipping...")
+        failure_flags["empty"] = 1  # Mark failure if dataset is empty
+        return failure_flags
 
     # Load the schema
     schema = load_schema(schema_path)
     if schema is None:
-        return (0, 0, 0)
+        print(f"Failed to load schema for {dataset}.")
+        failure_flags["loaded"] = 1  # Mark failure if schema fails to load
+        return failure_flags
     
     # Check if the schema contains patternProperties
     if has_pattern_properties_string_search(schema):
         print(f"Skipping {dataset} due to patternProperties in the schema.")
-        return (0, 0, 1)
+        failure_flags["pattern_properties"] = 1  # Mark failure if schema has patternProperties
+        return failure_flags
     
-    # Load and dereference the schema if needed
-    dereferenced_schema, dereferenced_flag = load_and_dereference_schema(schema_path)
-    
-    # If dereferencing fails, return the appropriate flags
+    # Load and dereference the schema
+    dereferenced_schema = load_and_dereference_schema(schema_path)
     if dereferenced_schema is None:
         print(f"Skipping {dataset} due to schema dereferencing failure.")
-        return (dereferenced_flag, 0, 0)
+        failure_flags["dereferenced"] = 1  # Mark failure if dereferencing fails
+        return failure_flags
 
     # Try modifying the schema to prevent additional properties
     try:
         modified_schema = prevent_additional_properties(dereferenced_schema)
-        modified_flag = 1
     except Exception as e:
         print(f"Error modifying schema for {dataset}: {e}")
-        modified_schema = deepcopy(dereferenced_schema)
-        modified_flag = 0
-    
+        failure_flags["modified"] = 1  # Mark failure if modification fails
+        modified_schema = dereferenced_schema  # Use dereferenced schema if modification fails
+
     # Validate all documents against the modified schema
-    all_docs, invalid_docs = validate_all_documents(dataset, files_folder, modified_schema)
+    all_docs, invalid_docs = validate_all_documents(dataset_path, modified_schema)
     print(f"Total number of documents in {dataset} is {len(all_docs)}")
     print(f"Number of invalid documents in {dataset} is {len(invalid_docs)}")
 
-    if invalid_docs:
-        print(f"Validation failed for at least one document in {dataset}, reverting to original schema.")
-        schema_to_use = deepcopy(modified_schema)
-    else:
-        print(f"All documents in {dataset} passed validation with modified schema.")
-        schema_to_use = deepcopy(modified_schema)
+    # Save the schema only if there are valid documents
+    if len(all_docs) > 0:
+        # Revert to dereferenced schema if validation fails
+        if invalid_docs:
+            print(f"Validation failed for at least one document in {dataset}, reverting to original schema.")
+            schema_to_use = dereferenced_schema
+        else:
+            print(f"All documents in {dataset} passed validation with modified schema.")
+            schema_to_use = modified_schema
         
-    if not all_docs:
-        print(f"No valid documents found in {dataset}. Skipping schema and JSON creation.")
-        return (dereferenced_flag, modified_flag, 0)
-    
-    # Save the schema to the processed_schemas folder
-    schema_save_path = os.path.join(PROCESSED_SCHEMAS_FOLDER, dataset)
-    save_to_file(schema_to_use, schema_save_path)
+        # Save the schema to the processed_schemas folder
+        schema_save_path = os.path.join(PROCESSED_SCHEMAS_FOLDER, dataset)
+        save_to_file(schema_to_use, schema_save_path)
 
-    # Save JSON Lines file with the same name as the schema
-    json_save_path = os.path.join(PROCESSED_JSONS_FOLDER, dataset)
-    save_json_lines(all_docs, json_save_path)
+        # Save JSON lines file with the same name as the schema
+        json_save_path = os.path.join(PROCESSED_JSONS_FOLDER, dataset)
+        save_json_lines(all_docs, json_save_path)
+    else:
+        print(f"No valid documents found for {dataset}. Skipping schema save.")
 
-    return (dereferenced_flag, modified_flag, 0)  # Return success flags and patternProperties flag
+    return failure_flags
 
 
 def process_datasets():
     """
     Process the datasets in parallel and save the resulting schemas and JSON files in processed folders.
-    Also keep track of the number of schemas successfully dereferenced, modified, and those with pattern properties.
+    Keep track of the number of schemas successfully dereferenced, modified, those with pattern properties, 
+    empty datasets, and skipped datasets. Print the remaining number of schemas after each criterion.
     """
     datasets = os.listdir(SCHEMA_FOLDER)
+    original_count = len(datasets) 
     
     # Recreate the processed folders
     recreate_directory(PROCESSED_SCHEMAS_FOLDER)
     recreate_directory(PROCESSED_JSONS_FOLDER)
 
-    # Initialize counters for dereferenced, modified schemas, and pattern properties
+    # Initialize counters
+    exist_count = 0
+    empty_count = 0
+    load_count = 0 
     dereference_count = 0
     modify_count = 0
     pattern_properties_count = 0
-    '''
-    for dataset in datasets:
-        if dataset != "sourcery.json":
-            continue
-        print(f"Processing dataset {dataset}...")
-        process_single_dataset(dataset, JSON_FOLDER)
-    sys.exit(0)
-    '''
+
     with ProcessPoolExecutor() as executor:
-        future_to_dataset = {executor.submit(process_single_dataset, dataset, JSON_FOLDER): dataset for dataset in datasets}
+        future_to_dataset = {executor.submit(process_single_dataset, dataset): dataset for dataset in datasets}
         
-        for future in tqdm.tqdm(as_completed(future_to_dataset), total=len(datasets)):
+        for future in tqdm.tqdm(as_completed(future_to_dataset), total=original_count):
             dataset = future_to_dataset[future]
             try:
-                deref_flag, mod_flag, pattern_flag = future.result()
-                dereference_count += deref_flag
-                modify_count += mod_flag
-                pattern_properties_count += pattern_flag
+                flags = future.result()
+
+                # Track failures
+                exist_count += flags["exist"] 
+                empty_count += flags["empty"]
+                load_count += flags["loaded"]
+                pattern_properties_count += flags["pattern_properties"]
+
+                # Only count dereferencing and modification if the schema had valid documents
+                if flags["dereferenced"] and flags["empty"] == 0:
+                    dereference_count += 1
+                if flags["modified"] and flags["empty"] == 0:
+                    modify_count += 1
+
             except Exception as e:
                 print(f"Error processing dataset {dataset}: {e}")
 
-    print(f"Total successfully dereferenced schemas: {dereference_count}")
-    print(f"Total successfully modified schemas: {modify_count}")
-    print(f"Total schemas with patternProperties: {pattern_properties_count}")
+    # Print the count after each criterion
+    print(f"Original number of datasets: {original_count}")
+    print(f"Remaining after skipping non-existent datasets: {original_count - exist_count}")
+    print(f"Remaining after removing empty datasets: {original_count - exist_count - empty_count}")
+    print(f"Remaining after removing schemas failing to load: {original_count - exist_count - empty_count - load_count}")
+    print(f"Remaining after removing schemas with patternProperties: {original_count - exist_count - empty_count - load_count - pattern_properties_count}")
+    print(f"Remaining after removing schemas failing to be dereferenced: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count}")
+    print(f"Schemas failing to be modified: {modify_count}")
+
 
 def main():
     process_datasets()
