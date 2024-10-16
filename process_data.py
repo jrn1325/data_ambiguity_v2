@@ -307,6 +307,9 @@ def label_paths(df, static_paths):
     Args:
         df (pd.DataFrame): The DataFrame containing the paths as tuples.
         static_paths (set): A set of static paths to compare against.
+
+    Returns:
+        pd.DataFrame: The DataFrame with an additional 'label' column.
     """
     # Initialize the label column with default value of 1
     df["label"] = 1
@@ -332,13 +335,12 @@ def label_paths(df, static_paths):
     return df
 
 
-def process_dataset(dataset, files_folder):
+def process_dataset(dataset):
     """
     Process and extract data from the documents, and return a DataFrame.
     
     Args:
         dataset (str): The name of the dataset file.
-        files_folder (str): The folder where the dataset files are stored.
     
     Returns:
         pd.DataFrame or None: A DataFrame for the dataset, or None if no data is processed.
@@ -353,7 +355,7 @@ def process_dataset(dataset, files_folder):
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
     schema = load_schema(schema_path)
 
-    dataset_path = os.path.join(files_folder, dataset)
+    dataset_path = os.path.join(JSON_FOLDER, dataset)
 
     with open(dataset_path, 'r') as file:
         for line in file:
@@ -398,38 +400,24 @@ def process_dataset(dataset, files_folder):
     return df
 
 
-def preprocess_data(schema_list, files_folder):
+def preprocess_data(schema_list):
     """
     Preprocess all dataset files in a folder, parallelizing the task across multiple CPUs.
 
     Args:
         schema_list (list): List of schema files to use for processing.
-        files_folder (str): The folder containing the dataset files.
 
     Returns:
         pd.DataFrame: A merged DataFrame containing labeled data from all datasets.
     """
-    datasets = os.listdir(files_folder)
+    datasets = os.listdir(JSON_FOLDER)
 
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
-    
-    '''
-    for i, dataset in enumerate(datasets):
-        if dataset != "dotnetcli-host-json.json":#ecosystem-json.json":
-            continue
-        df = process_dataset(dataset, files_folder)
-        sys.exit(0)
-        if df is not None:
-            if i == 0:
-                frames = [df]
-            else:
-                frames.append(df)   
-    '''
   
     # Process each dataset in parallel
     with ProcessPoolExecutor(max_workers=4) as executor:
-        frames = list(tqdm.tqdm(executor.map(process_dataset, datasets, [files_folder] * len(datasets)), total=len(datasets)))
+        frames = list(tqdm.tqdm(executor.map(process_dataset, datasets), total=len(datasets)))
 
     # Filter out any datasets that returned None
     frames = [df for df in frames if df is not None]
@@ -470,7 +458,7 @@ def resample_data(df):
 def main():
     try:
         # Parse command-line arguments
-        files_folder, train_size, random_value = sys.argv[-3:]
+        train_size, random_value = sys.argv[-2:]
         train_ratio = float(train_size)
         random_value = int(random_value)
         
@@ -478,13 +466,13 @@ def main():
         train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
 
         # Preprocess and oversample the training data
-        train_df = preprocess_data(train_set, files_folder)
+        train_df = preprocess_data(train_set)
         train_df = resample_data(train_df)
         train_df = train_df.sort_values(by=["filename", "path"])
         train_df.to_csv("train_data.csv", index=False)
     
         # Preprocess the testing data
-        test_df = preprocess_data(test_set, files_folder)
+        test_df = preprocess_data(test_set)
         test_df.to_csv("test_data.csv", index=False)
     
     except (ValueError, IndexError) as e:
