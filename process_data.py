@@ -4,7 +4,6 @@ import math
 import numpy as np
 import os
 import pandas as pd
-import re
 import sys
 import tqdm
 from collections import defaultdict
@@ -237,7 +236,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
         # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
-            "schema": schema_info,
+            "schema": json.dumps(schema_info),
             "datatype_entropy": datatype_entropy,
             "key_entropy": key_entropy,
             "filename": dataset
