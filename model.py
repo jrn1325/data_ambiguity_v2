@@ -406,7 +406,8 @@ def run_jxplain(test_df):
     """
     Perform the Jxplain method to classify dynamic keys based on datatype entropy 
     and key entropy. The method calculates and prints performance metrics 
-    (accuracy, precision, recall, and F1 score) for both classes (dynamic and static keys).
+    (accuracy, precision, recall, and F1 score) for both classes (dynamic and static keys) 
+    as well as combined metrics.
 
     Args:
         test_df (pd.DataFrame): DataFrame containing test data.
@@ -419,17 +420,27 @@ def run_jxplain(test_df):
     y_pred = ((test_df["datatype_entropy"] == 0) & (test_df["key_entropy"] > 1)).astype(int)
     y_test = test_df["label"]
 
-    # Calculate the accuracy
-    accuracy = accuracy_score(y_test, y_pred)
+    # Calculate overall accuracy
+    overall_accuracy = accuracy_score(y_test, y_pred)
 
-    # Calculate precision, recall, F1-score for both classes
+    # Calculate precision, recall, and F1-score for both classes
     precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average=None, labels=[0, 1])
 
-    # Print the performance metrics for both classes
-    print(f"Accuracy: {accuracy}")
-    print(f"Class 0 (Static) - Precision: {precision[0]}, Recall: {recall[0]}, F1 Score: {f1_score[0]}")
-    print(f"Class 1 (Dynamic) - Precision: {precision[1]}, Recall: {recall[1]}, F1 Score: {f1_score[1]}")
+    # Calculate combined metrics (macro average)
+    combined_precision, combined_recall, combined_f1, _ = precision_recall_fscore_support(y_test, y_pred, average='macro')
 
+    # Calculate accuracy for positive and negative classes
+    positive_accuracy = accuracy_score(y_test[y_test == 1], y_pred[y_test == 1])  # Accuracy for positive class
+    negative_accuracy = accuracy_score(y_test[y_test == 0], y_pred[y_test == 0])  # Accuracy for negative class
+
+    # Print performance metrics for the negative class (static)
+    print(f"Class 0 (Static) - Precision: {precision[0]:.4f}, Recall: {recall[0]:.4f}, F1 Score: {f1_score[0]:.4f}, Accuracy: {negative_accuracy:.4f}")
+
+    # Print performance metrics for the positive class (dynamic)
+    print(f"Class 1 (Dynamic) - Precision: {precision[1]:.4f}, Recall: {recall[1]:.4f}, F1 Score: {f1_score[1]:.4f}, Accuracy: {positive_accuracy:.4f}")
+
+    # Print combined metrics
+    print(f"Both Classes (Overall) - Precision: {combined_precision:.4f}, Recall: {combined_recall:.4f}, F1 Score: {combined_f1:.4f}, Accuracy: {overall_accuracy:.4f}")
 
 
 

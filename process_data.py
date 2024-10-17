@@ -18,8 +18,6 @@ warnings.filterwarnings("ignore")
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 JSON_FOLDER = "processed_jsons"
 SCHEMA_FOLDER = "processed_schemas"
-SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
-
 
 
 def split_data(train_ratio=0.8, random_value=101):
@@ -164,7 +162,7 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
             nested_key = path[-1]
             if nested_key == "*":
                 continue
-            prefix = path[:-1]
+            prefix = path[:-1] 
 
             # Initialize or update the frequency and type information
             if prefix not in path_types_dict:
@@ -174,7 +172,6 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
             value_type = get_json_format(value)
 
             # Update the frequency count for the nested key
-            
             if nested_key in path_types_dict[prefix]:
                 path_types_dict[prefix][nested_key]["frequency"] += 1
             else:
@@ -217,7 +214,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
             frequencies.append(frequency)
 
             # Calculate the relative frequency
-            parent_frequency = parent_frequency_dict.get(path, 1)
+            parent_frequency = parent_frequency_dict.get(path)
             relative_frequency = frequency / parent_frequency
 
             # Store the key details in the schema dictionary
@@ -236,7 +233,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
         # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
-            "schema": json.dumps(schema_info),
+            "schema": schema_info,
             "datatype_entropy": datatype_entropy,
             "key_entropy": key_entropy,
             "filename": dataset
@@ -416,7 +413,7 @@ def preprocess_data(schema_list):
     datasets = [dataset for dataset in datasets if dataset in schema_list]
   
     # Process each dataset in parallel
-    with ProcessPoolExecutor(max_workers=4) as executor:
+    with ProcessPoolExecutor() as executor:
         frames = list(tqdm.tqdm(executor.map(process_dataset, datasets), total=len(datasets)))
 
     # Filter out any datasets that returned None
