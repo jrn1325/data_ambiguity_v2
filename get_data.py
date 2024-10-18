@@ -318,7 +318,7 @@ def process_single_dataset(dataset):
 
     # Save the schema only if there are valid documents
     if len(all_docs) > 0:
-        # Revert to dereferenced schema if validation fails
+        # Revert to dereferenced schema if validation fails for at lleast 1 document
         if invalid_docs_count == 0:
             print(f"All documents in {dataset} passed validation with modified schema.")
         else:
