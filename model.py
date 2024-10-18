@@ -258,16 +258,17 @@ def test_model(test_df, tokenizer, model, device, wandb):
     # Calculate accuracy, precision, recall, and F1 score for the positive class (dynamic)
     true_labels_positive, predicted_labels_positive = filter_labels_positive(total_actual_labels, total_predicted_labels)
     dynamic_accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
-    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1, average="weighted")
+    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1, average="weighted")
+    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1, average="weighted")
+
 
     # Calculate accuracy, precision, recall, and F1 score for the negative class (static)
     true_labels_negative, predicted_labels_negative = filter_labels_negative(total_actual_labels, total_predicted_labels)
-    static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative)
-    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative, average="weighted")
+    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0, average="weighted")
+    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0, average="weighted")
+    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0, average="weighted")
 
     # Log the performance metrics for dynamic and static classes to Weights and Biases (wandb)
     wandb.log({
