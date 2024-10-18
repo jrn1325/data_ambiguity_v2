@@ -1,9 +1,9 @@
 import json
-import jsonref
 import math
 import numpy as np
 import os
 import pandas as pd
+import re
 import sys
 import tqdm
 from collections import defaultdict
@@ -293,17 +293,30 @@ def get_static_paths(schema, parent_path=("$",)):
         if combiner in schema:
             for sub_schema in schema[combiner]:
                 yield from get_static_paths(sub_schema, parent_path)
+
+    # Handle patternProperties
+    if "patternProperties" in schema:
+        for pattern, pattern_schema in schema["patternProperties"].items():
+            full_path = parent_path + (pattern,)
+
+            if isinstance(pattern_schema, dict):
+                 # If additionalProperties is explicitly False, yield the path
+                if pattern_schema.get("additionalProperties") == False:
+                    yield full_path 
+                
+                # Recursively check nested properties
+                yield from get_static_paths(pattern_schema, full_path)
   
 
 def label_paths(df, static_paths):
     """
     Label rows in the DataFrame as:
-    - 0 for static paths and their descendants
+    - 0 for static paths and their descendants, including regular expressions.
     - 1 for paths not matching static paths, treating 'wildpath' as a wildcard.
 
     Args:
         df (pd.DataFrame): The DataFrame containing the paths as tuples.
-        static_paths (set): A set of static paths to compare against.
+        static_paths (set): A set of static paths to compare against, potentially including regex patterns.
 
     Returns:
         pd.DataFrame: The DataFrame with an additional 'label' column.
@@ -315,21 +328,36 @@ def label_paths(df, static_paths):
         # Label the static path itself as 0
         df.loc[df["path"] == static_path, "label"] = 0
 
-        # Handle paths containing 'wildpath'
+        # Handle paths containing 'wildpath' or regex
         for index, row in df.iterrows():
             row_path = row["path"]
             
-            # Check if the row path matches static path except for "wildpath"
+            # Check if the row path matches the static path, including regex and 'wildpath'
             if len(row_path) == len(static_path):
                 match = True
                 for sp, rp in zip(static_path, row_path):
-                    if sp != "wildpath" and sp != rp:
-                        match = False
-                        break
+                    if sp == "wildpath":
+                        # Wildpath matches any part of the row path
+                        continue
+                    else:
+                        try:
+                            # Try matching regex if sp is a valid pattern
+                            if re.fullmatch(sp, rp):
+                                continue
+                            else:
+                                match = False
+                                break
+                        except re.error:
+                            # If not a valid regex, compare the strings directly
+                            if sp != rp:
+                                match = False
+                                break
+                
                 if match:
                     df.at[index, "label"] = 0
 
     return df
+
 
 
 def process_dataset(dataset):
