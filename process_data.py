@@ -195,7 +195,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
         num_docs (int): The number of documents in the dataset.
 
     Returns:
-        pd.DataFrame: A DataFrame with 'path', 'schema', and 'filename' columns.
+        pd.DataFrame: A DataFrame with 'path', 'schema', and 'filename' columns, with additional columns for entropy.
     """
     data = []
 
@@ -357,7 +357,6 @@ def label_paths(df, static_paths):
                     df.at[index, "label"] = 0
 
     return df
-
 
 
 def process_dataset(dataset):
