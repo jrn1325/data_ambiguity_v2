@@ -2,7 +2,6 @@ import json
 import jsonref
 import os
 import shutil
-import sys
 import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from jsonschema.validators import validator_for
