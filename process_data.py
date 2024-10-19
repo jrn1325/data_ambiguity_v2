@@ -306,7 +306,16 @@ def get_static_paths(schema, parent_path=("$",)):
                 
                 # Recursively check nested properties
                 yield from get_static_paths(pattern_schema, full_path)
-  
+    
+    # Handle if-then-else
+    if "if" in schema and "then" in schema:
+        # Traverse 'then' if 'if' exists
+        yield from get_static_paths(schema["then"], parent_path)
+
+    if "else" in schema:
+        # Traverse 'else' if 'else' exists
+        yield from get_static_paths(schema["else"], parent_path)
+
 
 def label_paths(df, static_paths):
     """

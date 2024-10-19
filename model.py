@@ -1,3 +1,4 @@
+import json
 import os
 import pandas as pd
 import sys
@@ -14,12 +15,14 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Create constant variables
+SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 BATCH_SIZE = 120
 MAX_TOKEN_LEN = 512
 ADAPTER_NAME = "data_ambiguity"
 MODEL_NAME = "microsoft/codebert-base"
 PATH = "./adapter-model"
+# Use os.path.expanduser to expand '~' to the full home directory path
 SCHEMA_FOLDER = "processed_schemas"
 JSON_FOLDER = "processed_jsons"
 
@@ -56,7 +59,7 @@ class CustomDataset(Dataset):
         label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
 
         tokenized_distinct_subkeys = self.tokenizer(
-            distinct_subkeys,
+            json.dumps(distinct_subkeys),
             truncation=True,
             padding="max_length",
             return_tensors="pt",
@@ -93,21 +96,12 @@ def initialize_model():
    
 
 def train_model(train_df, test_df):
-    """
-    Trains a CodeBERT model using the provided training and testing datasets.
 
-    Args:
-        train_df (pd.DataFrame): Training dataset containing input text and labels.
-        test_df (pd.DataFrame): Testing dataset containing input text and labels.
-
-    Returns:
-        None
-    """
     accumulation_steps = 4
     learning_rate = 1e-6
     num_epochs = 75
 
-    # Initialize Weights and Biases (wandb) to track the training process
+    # Start a new wandb run to track this script
     wandb.init(
         project="custom-codebert_all_files_25",
         config={
@@ -120,26 +114,25 @@ def train_model(train_df, test_df):
         }
     )
 
-    # Initialize the tokenizer and model with an adapter and classification head
+    # Initialize tokenizer, model with adapter and classification head
     model, tokenizer = initialize_model()
 
-    # Set up the optimizer with AdamW optimization
+    # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
 
-    # If multiple GPUs are available, use DataParallel to distribute the model across them
+    # Use all available GPUs
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
 
-    # Set the device for model training (use GPU if available, otherwise CPU)
+    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Prepare the custom dataset and DataLoader for training
     train_dataset = CustomDataset(train_df, tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: collate_fn(x))
 
-    # Set up a learning rate scheduler to adjust the learning rate during training
+    # Set up scheduler to adjust the learning rate during training
     num_training_steps = num_epochs * len(train_dataloader)
     num_warmup_steps = int(0.1 * num_training_steps)
     lr_scheduler = get_scheduler(
@@ -149,229 +142,179 @@ def train_model(train_df, test_df):
         num_training_steps=num_training_steps,
     )
 
-    # Initialize an early stopper to stop training if the validation loss plateaus
-    early_stopper = EarlyStopper(patience=1, min_delta=0.005)  # Stops if no improvement in 1 epoch
+    early_stopper = EarlyStopper(patience=1, min_delta=0.005) # training steps if the validation loss does not decrease by at least 0.005 for 1 consecutive epochs
 
-    # Train the model over multiple epochs
+    # Train the model
     model.train()
     pbar = tqdm.tqdm(range(num_epochs), position=0, desc="Epoch")
     for epoch in pbar:
         total_loss = 0
-        
-        # Iterate over the training data
         for i, batch in enumerate(tqdm.tqdm(train_dataloader, position=1, leave=False, total=len(train_dataloader))):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-            
-            # Forward pass to calculate the model outputs and training loss
+            # Forward pass
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+  
+            # Calculate the training loss
             training_loss = outputs.loss
 
-            # If using DataParallel, average the loss across multiple GPUs
+            # Need to average the loss if we are using DataParallel
             if training_loss.dim() > 0:
                 training_loss = training_loss.mean()
 
-            # Backpropagate the loss
             training_loss.backward()
-
-            # Accumulate gradients and perform an optimizer step
+            
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_dataloader):
                 optimizer.step()
-                lr_scheduler.step()  # Update the learning rate
-                optimizer.zero_grad()  # Clear gradients
+                lr_scheduler.step()
+                optimizer.zero_grad()
         
-            total_loss += training_loss.item()  # Track total loss
+            total_loss += training_loss.item()
         
-        # Calculate and log the average training loss for the epoch
         average_loss = total_loss / len(train_dataloader)
         wandb.log({"training_loss": average_loss})
 
-        # Evaluate the model on the test dataset after each epoch
+        # Test the model
         testing_loss = test_model(test_df, tokenizer, model, device, wandb)
 
-        # Check if early stopping criteria are met
         if early_stopper.early_stop(testing_loss):
             print(f"Early stopping at epoch {epoch + 1}")
             break
         
-    # Save the model and its adapter for future use
+    # Save the adapter
     save_model_and_adapter(model.module)
     wandb.save(f"{PATH}/*")
 
     
 def test_model(test_df, tokenizer, model, device, wandb):
-    """
-    Evaluates the trained CodeBERT model on a given test dataset and calculates
-    performance metrics such as accuracy, precision, recall, and F1 score for both
-    dynamic (positive) and static (negative) classifications.
-
-    Args:
-        test_df (pd.DataFrame): Test dataset containing input text and labels.
-        tokenizer (PreTrainedTokenizer): Tokenizer for processing input text.
-        model (nn.Module): The trained model to be evaluated.
-        device (torch.device): The device on which to perform the evaluation (CPU or GPU).
-        wandb (wandb): Weights and Biases object for logging performance metrics.
-
-    Returns:
-        average_loss (float): The average loss calculated over the test dataset.
-    """
-
-    # Prepare the test dataset and DataLoader for evaluation
     test_dataset = CustomDataset(test_df, tokenizer)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
 
-    # Set the model to evaluation mode
     model.eval()
     total_loss = 0.0
 
-    # Lists to store actual and predicted labels
     total_actual_labels = []
     total_predicted_labels = []
 
-    # Disable gradient calculation for evaluation
     with torch.no_grad():
         for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-            
-            # Forward pass to get model outputs
+            # Forward pass
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
-            # Extract logits (raw model predictions before applying softmax)
+            # Get the probabilities
             logits = outputs.logits
 
-            # Calculate the loss for this batch
+            # Calculate the testing loss
             testing_loss = outputs.loss
 
-            # Average the loss across multiple GPUs if DataParallel is used
+            # Need to average the loss if we are using DataParallel
             if testing_loss.dim() > 0:
                 testing_loss = testing_loss.mean()
             total_loss += testing_loss.item()
 
-            # Get the actual labels and predicted labels from the logits
+            # Get the actual and predicted labels
             actual_labels = labels.cpu().numpy()
             predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
             total_actual_labels.extend(actual_labels)
             total_predicted_labels.extend(predicted_labels)
 
-    # Calculate the average loss across the entire test dataset
     average_loss = total_loss / len(test_loader)
 
-    # Calculate accuracy, precision, recall, and F1 score for the positive class (dynamic)
-    true_labels_positive, predicted_labels_positive = filter_labels_positive(total_actual_labels, total_predicted_labels)
-    dynamic_accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
-    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1, average="weighted")
-    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1, average="weighted")
-    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1, average="weighted")
-
-
-    # Calculate accuracy, precision, recall, and F1 score for the negative class (static)
-    true_labels_negative, predicted_labels_negative = filter_labels_negative(total_actual_labels, total_predicted_labels)
-    static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative, average="weighted")
-    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0, average="weighted")
-    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0, average="weighted")
-    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0, average="weighted")
-
-    # Log the performance metrics for dynamic and static classes to Weights and Biases (wandb)
-    wandb.log({
-        "dynamic accuracy": dynamic_accuracy,
-        "testing_loss": average_loss,
-        "dynamic precision": dynamic_precision,
-        "dynamic recall": dynamic_recall,
-        "dynamic F1": dynamic_f1
-    })
-    wandb.log({
-        "static accuracy": static_accuracy,
-        "static precision": static_precision,
-        "static recall": static_recall,
-        "static F1": static_f1
-    })
-
-    # Return the average test loss for this evaluation run
-    return average_loss
-    
-
-def evaluate_model(test_df):
-    """
-    Evaluates the model on a given test dataset, calculates performance metrics 
-    (accuracy, precision, recall, F1 score) for both dynamic (positive) and static 
-    (negative) classifications, and prints the results.
-
-    Args:
-        test_df (pd.DataFrame): DataFrame containing the test data with input text and labels.
-
-    Returns:
-        float: The average testing loss calculated over the test dataset.
-    """
-
-    # Load the pre-trained model and tokenizer, along with any attached adapters
-    model, tokenizer = load_model_and_adapter()
-
-    # If multiple GPUs are available, use DataParallel for distributing the model across GPUs
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-
-    # Set the device to GPU if available, otherwise use CPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    # Prepare the test dataset and DataLoader
-    test_dataset = CustomDataset(test_df, tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
-
-    total_loss = 0.0  # To accumulate the total loss over all batches
-    total_actual_labels = []  # To store the actual labels from the test set
-    total_predicted_labels = []  # To store the predicted labels from the model
-
-    # Set the model to evaluation mode (disabling dropout, etc.)
-    model.eval()
-
-    # Disable gradient calculation for evaluation (saves memory and computation)
-    with torch.no_grad():
-        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
-            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-
-            # Forward pass through the model
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-            # Extract the logits (raw model predictions before applying softmax)
-            logits = outputs.logits
-
-            # Calculate the loss for the current batch
-            testing_loss = outputs.loss
-
-            # If using DataParallel, average the loss across GPUs
-            if testing_loss.dim() > 0:
-                testing_loss = testing_loss.mean()
-            total_loss += testing_loss.item()
-
-            # Extract the actual labels and predicted labels for this batch
-            actual_labels = labels.cpu().numpy()
-            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
-            total_actual_labels.extend(actual_labels)
-            total_predicted_labels.extend(predicted_labels)
-
-        # Calculate the average loss across the entire test dataset
-        average_loss = total_loss / len(test_loader)
-
-    # Calculate accuracy, precision, recall, and F1 score for the positive class (dynamic)
+    # Calculate the accuracy, precision, recall, f1 score of the positive class
     true_labels_positive, predicted_labels_positive = filter_labels_positive(total_actual_labels, total_predicted_labels)
     dynamic_accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
     dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
     dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
     dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
 
-    # Calculate accuracy, precision, recall, and F1 score for the negative class (static)
+    # Calculate the accuracy, precision, recall, f1 score of the negative class
     true_labels_negative, predicted_labels_negative = filter_labels_negative(total_actual_labels, total_predicted_labels)
     static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative)
     static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
     static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
     static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    
+    #print(f'accuracy: {accuracy}, precision: {precision}, recall: {recall}, F1: {f1}')
+    wandb.log({"dynamic accuracy": dynamic_accuracy, "testing_loss": average_loss, "dynamic precision": dynamic_precision, "dynamic recall": dynamic_recall, "dynamic F1": dynamic_f1})
+    wandb.log({"static accuracy": static_accuracy, "static precision": static_precision, "static recall": static_recall, "static F1": static_f1})
 
-    # Print the evaluation metrics for both dynamic and static classes
+
+    return average_loss
+    
+
+def evaluate_model(test_df):
+    """
+    Evaluate the model on the test data.
+
+    Args:
+        test_df (pd.DataFrame): DataFrame containing the test data.
+
+    Returns:
+        float: Average testing loss.
+    """
+    # Load model adapter
+    model, tokenizer = load_model_and_adapter()
+
+    # Use all available GPUs
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    test_dataset = CustomDataset(test_df, tokenizer)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
+    
+    total_loss = 0.0
+    total_actual_labels = []
+    total_predicted_labels = []
+
+    # Set the model to evaluation mode
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
+            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
+            # Forward pass
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+            # Get the probabilities
+            logits = outputs.logits
+
+            # Calculate the testing loss
+            testing_loss = outputs.loss
+
+            # Need to average the loss if we are using DataParallel
+            if testing_loss.dim() > 0:
+                testing_loss = testing_loss.mean()
+            total_loss += testing_loss.item()
+
+            # Get the actual and predicted labels
+            actual_labels = labels.cpu().numpy()
+            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
+            total_actual_labels.extend(actual_labels)
+            total_predicted_labels.extend(predicted_labels)
+
+        average_loss = total_loss / len(test_loader)
+
+    # Calculate the accuracy, precision, recall, f1 score of the positive class
+    true_labels_positive, predicted_labels_positive = filter_labels_positive(total_actual_labels, total_predicted_labels)
+    dynamic_accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
+    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
+
+    # Calculate the accuracy, precision, recall, f1 score of the negative class
+    true_labels_negative, predicted_labels_negative = filter_labels_negative(total_actual_labels, total_predicted_labels)
+    static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative)
+    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    
     print(f"dynamic accuracy: {dynamic_accuracy}, testing_loss: {average_loss}, dynamic precision: {dynamic_precision}, dynamic recall: {dynamic_recall}, dynamic F1: {dynamic_f1}")
     print(f"static accuracy: {static_accuracy}, testing_loss: {average_loss}, static precision: {static_precision}, static recall: {static_recall}, static F1: {static_f1}")
 
-    # Return the average testing loss
     return average_loss
 
 
@@ -485,7 +428,7 @@ def run_jxplain(test_df):
     precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average=None, labels=[0, 1])
 
     # Calculate combined metrics (macro average)
-    combined_precision, combined_recall, combined_f1, _ = precision_recall_fscore_support(y_test, y_pred, average="weighted")
+    combined_precision, combined_recall, combined_f1, _ = precision_recall_fscore_support(y_test, y_pred, average='weighted')
 
     # Calculate accuracy for positive and negative classes
     positive_accuracy = accuracy_score(y_test[y_test == 1], y_pred[y_test == 1])  # Accuracy for positive class
@@ -499,6 +442,7 @@ def run_jxplain(test_df):
 
     # Print combined metrics
     print(f"Both Classes (Overall) - Precision: {combined_precision:.4f}, Recall: {combined_recall:.4f}, F1 Score: {combined_f1:.4f}, Accuracy: {overall_accuracy:.4f}")
+
 
 
 def main():

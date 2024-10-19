@@ -288,6 +288,7 @@ def process_single_dataset(dataset):
         failure_flags["loaded"] = 1 
         return failure_flags
     
+    
     # Check if the schema contains patternProperties
     if has_pattern_properties_string_search(schema):
         print(f"Skipping {dataset} due to patternProperties in the schema.")
@@ -388,7 +389,7 @@ def process_datasets():
     print(f"Remaining after removing empty datasets: {original_count - exist_count - empty_count}")
     print(f"Remaining after removing schemas failing to load: {original_count - exist_count - empty_count - load_count}")
     print(f"Remaining after removing schemas with patternProperties: {original_count - exist_count - empty_count - load_count - pattern_properties_count}")
-    print(f"Remaining after removing schemas failing to be dereferenced: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count}")
+    print(f"Remaining after removing schemas failing to dereference: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count}")
     print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count - validation_count}")
     print(f"Schemas failing to be modified: {modify_count}")
 
