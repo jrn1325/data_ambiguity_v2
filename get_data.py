@@ -271,66 +271,67 @@ def process_single_dataset(dataset):
 
     # Check if the dataset exists
     if not os.path.exists(dataset_path):
-        print(f"Dataset {dataset} does not exist in {JSON_FOLDER}. Skipping...")
+        print(f"Dataset {dataset} does not exist in {JSON_FOLDER}. Skipping...", flush=True)
         failure_flags["exist"] = 1 
         return failure_flags
     
     # Check if the dataset is empty
     if os.stat(dataset_path).st_size == 0:
-        print(f"Dataset {dataset} is empty. Skipping...")
+        print(f"Dataset {dataset} is empty. Skipping...", flush=True)
         failure_flags["empty"] = 1 
         return failure_flags
 
     # Load the schema
     schema = load_schema(schema_path)
     if schema is None:
-        print(f"Failed to load schema for {dataset}.")
+        print(f"Failed to load schema for {dataset}.", flush=True)
         failure_flags["loaded"] = 1 
         return failure_flags
     
-    
+    '''
     # Check if the schema contains patternProperties
     if has_pattern_properties_string_search(schema):
-        print(f"Skipping {dataset} due to patternProperties in the schema.")
+        print(f"Skipping {dataset} due to patternProperties in the schema.", flush=True)
         failure_flags["pattern_properties"] = 1 
         return failure_flags
+    '''
     
     # Load and dereference the schema
     dereferenced_schema = load_and_dereference_schema(schema_path)
     print("type", type(dereferenced_schema))
     if dereferenced_schema is None or type(dereferenced_schema) is not dict:
-        print(f"Skipping {dataset} due to schema dereferencing failure.")
+        print(f"Skipping {dataset} due to schema dereferencing failure.", flush=True)
         failure_flags["dereferenced"] = 1 
         return failure_flags
 
     # Try modifying the schema to prevent additional properties
     try:
         modified_schema = prevent_additional_properties(dereferenced_schema)
-        print(f"Successfully modified schema {dataset}.")
+        print(f"Successfully modified schema {dataset}.", flush=True)
     except Exception as e:
-        print(f"Error modifying schema for {dataset}: {e}. Reverting to dereferenced schema.")
+        print(f"Error modifying schema for {dataset}: {e}. Reverting to dereferenced schema.", flush=True)
         failure_flags["modified"] = 1 
         modified_schema = dereferenced_schema
 
     # Validate all documents against the modified schema
     all_docs, invalid_docs_count = validate_all_documents(dataset_path, dereferenced_schema)
-    print(f"Total number of documents in {dataset} is {len(all_docs)}")
-    print(f"Number of invalid documents in {dataset} is {invalid_docs_count}")
+    print(f"Total number of documents in {dataset} is {len(all_docs)}", flush=True)
+    print(f"Number of invalid documents in {dataset} is {invalid_docs_count}", flush=True)
 
     # Save the schema only if there are valid documents
     if len(all_docs) > 0:
         # Revert to dereferenced schema if validation fails for at lleast 1 document
         if invalid_docs_count == 0:
-            print(f"All documents in {dataset} passed validation with modified schema.")
+            print(f"All documents in {dataset} passed validation with modified schema.", flush=True)
         else:
-            print(f"Validation failed for at least one document in {dataset}, reverting to original schema.")
+            print(f"Validation failed for at least one document in {dataset}, reverting to original schema.", flush=True)
         
         # Save the schema to the processed_schemas folder
         if save_json_schema(modified_schema, dataset):
             # Save JSON lines file with the same name as the schema
             save_json_documents(all_docs, dataset)
     else:
-        print(f"No valid documents found for {dataset}. Skipping schema save.")
+        print(f"No valid documents found for {dataset}. Skipping schema save.", flush=True)
         failure_flags["validation"] = 1 
         return failure_flags
 
@@ -384,14 +385,14 @@ def process_datasets():
                 print(f"Error processing dataset {dataset}: {e}")
 
     # Print the count after each criterion
-    print(f"Original number of datasets: {original_count}")
-    print(f"Remaining after skipping non-existent datasets: {original_count - exist_count}")
-    print(f"Remaining after removing empty datasets: {original_count - exist_count - empty_count}")
-    print(f"Remaining after removing schemas failing to load: {original_count - exist_count - empty_count - load_count}")
-    print(f"Remaining after removing schemas with patternProperties: {original_count - exist_count - empty_count - load_count - pattern_properties_count}")
-    print(f"Remaining after removing schemas failing to dereference: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count}")
-    print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count - validation_count}")
-    print(f"Schemas failing to be modified: {modify_count}")
+    print(f"Original number of datasets: {original_count}", flush=True)
+    print(f"Remaining after skipping non-existent datasets: {original_count - exist_count}", flush=True)
+    print(f"Remaining after removing empty datasets: {original_count - exist_count - empty_count}", flush=True)
+    print(f"Remaining after removing schemas failing to load: {original_count - exist_count - empty_count - load_count}", flush=True)
+    print(f"Remaining after removing schemas with patternProperties: {original_count - exist_count - empty_count - load_count - pattern_properties_count}", flush=True)
+    print(f"Remaining after removing schemas failing to dereference: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count}", flush=True)
+    print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count - validation_count}", flush=True)
+    print(f"Schemas failing to be modified: {modify_count}", flush=True)
 
 
 def main():
