@@ -325,6 +325,7 @@ def process_single_dataset(dataset):
             print(f"All documents in {dataset} passed validation with modified schema.", flush=True)
         else:
             print(f"Validation failed for at least one document in {dataset}, reverting to original schema.", flush=True)
+            modified_schema = dereferenced_schema
         
         # Save the schema to the processed_schemas folder
         if save_json_schema(modified_schema, dataset):
