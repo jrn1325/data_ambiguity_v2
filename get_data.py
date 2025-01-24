@@ -4,6 +4,7 @@ import os
 import shutil
 import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import deepcopy
 from jsonschema.validators import validator_for
 
 # Use os.path.expanduser to expand '~' to the full home directory path
@@ -298,43 +299,37 @@ def process_single_dataset(dataset):
     
     # Load and dereference the schema
     dereferenced_schema = load_and_dereference_schema(schema_path)
-    print("type", type(dereferenced_schema))
     if dereferenced_schema is None or type(dereferenced_schema) is not dict:
         print(f"Skipping {dataset} due to schema dereferencing failure.", flush=True)
         failure_flags["dereferenced"] = 1 
         return failure_flags
 
+    # Make a deep copy of the dereferenced schema for modification
+    copy_dereferenced_schema = deepcopy(dereferenced_schema)
+
     # Try modifying the schema to prevent additional properties
     try:
-        modified_schema = prevent_additional_properties(dereferenced_schema)
+        modified_schema = prevent_additional_properties(copy_dereferenced_schema)
         print(f"Successfully modified schema {dataset}.", flush=True)
     except Exception as e:
         print(f"Error modifying schema for {dataset}: {e}. Reverting to dereferenced schema.", flush=True)
         failure_flags["modified"] = 1 
-        modified_schema = dereferenced_schema
 
     # Validate all documents against the modified schema
-    all_docs, invalid_docs_count = validate_all_documents(dataset_path, dereferenced_schema)
-    print(f"Total number of documents in {dataset} is {len(all_docs)}", flush=True)
-    print(f"Number of invalid documents in {dataset} is {invalid_docs_count}", flush=True)
+    all_docs, invalid_docs_count = validate_all_documents(dataset_path, modified_schema)
+    print(f"Out of {len(all_docs)} documents, {invalid_docs_count} are invalid in {schema_path}", flush=True)
 
-    # Save the schema only if there are valid documents
-    if len(all_docs) > 0:
-        # Revert to dereferenced schema if validation fails for at lleast 1 document
-        if invalid_docs_count == 0:
-            print(f"All documents in {dataset} passed validation with modified schema.", flush=True)
-        else:
-            print(f"Validation failed for at least one document in {dataset}, reverting to original schema.", flush=True)
-            modified_schema = dereferenced_schema
-        
+    if invalid_docs_count == 0:
         # Save the schema to the processed_schemas folder
         if save_json_schema(modified_schema, dataset):
             # Save JSON lines file with the same name as the schema
             save_json_documents(all_docs, dataset)
     else:
-        print(f"No valid documents found for {dataset}. Skipping schema save.", flush=True)
+        # Save the schema to the processed_schemas folder
+        if save_json_schema(dereferenced_schema, dataset):
+            # Save JSON lines file with the same name as the schema
+            save_json_documents(all_docs, dataset)
         failure_flags["validation"] = 1 
-        return failure_flags
 
     return failure_flags
 
@@ -346,6 +341,7 @@ def process_datasets():
     empty datasets, and skipped datasets. Print the remaining number of schemas after each criterion.
     """
     datasets = os.listdir(SCHEMA_FOLDER)
+    #datasets = ["adonisrc-json.json"]
     original_count = len(datasets) 
     
     # Recreate the processed folders
