@@ -273,16 +273,13 @@ def get_static_paths(schema, parent_path=("$",)):
                 
                 # Recursively check nested properties
                 yield from get_static_paths(prop_schema, full_path)
-            else:
-                print(f"Skipping property '{prop}' at path {parent_path}: Expected a dictionary, got {type(prop_schema).__name__}")
 
     # Handle 'items' in arrays
     if "items" in schema:
         if isinstance(schema["items"], dict):
             if schema["items"].get("type") == "object" and schema["items"].get("additionalProperties") is False:
                 yield from get_static_paths(schema["items"], parent_path + ("*",))
-        else:
-            print(f"Skipping 'items' at path {parent_path}: Expected a dictionary, got {type(schema['items']).__name__}")
+
 
     # Handle 'additionalProperties'
     if "additionalProperties" in schema:
@@ -291,16 +288,12 @@ def get_static_paths(schema, parent_path=("$",)):
                 yield from get_static_paths(schema["additionalProperties"], parent_path + ("wildkey",))
         elif schema["additionalProperties"] is False:
             yield parent_path
-        elif not isinstance(schema["additionalProperties"], (bool, dict)):
-            print(f"Skipping 'additionalProperties' at path {parent_path}: Unexpected type {type(schema['additionalProperties']).__name__}")
 
     # Handle allOf, anyOf, oneOf
     for combiner in ["allOf", "anyOf", "oneOf"]:
         if combiner in schema and isinstance(schema[combiner], list):
             for sub_schema in schema[combiner]:
                 yield from get_static_paths(sub_schema, parent_path)
-        elif combiner in schema:
-            print(f"Skipping '{combiner}' at path {parent_path}: Expected a list, got {type(schema[combiner]).__name__}")
 
     # Handle 'patternProperties'
     if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
@@ -314,8 +307,6 @@ def get_static_paths(schema, parent_path=("$",)):
                 
                 # Recursively check nested properties
                 yield from get_static_paths(pattern_schema, full_path)
-            else:
-                print(f"Skipping pattern '{pattern}' at path {parent_path}: Expected a dictionary, got {type(pattern_schema).__name__}")
 
     # Handle if-then-else
     if "if" in schema and isinstance(schema["if"], dict):
@@ -323,7 +314,6 @@ def get_static_paths(schema, parent_path=("$",)):
             yield from get_static_paths(schema["then"], parent_path)
         if "else" in schema and isinstance(schema["else"], dict):
             yield from get_static_paths(schema["else"], parent_path)
-
 
 
 def is_path_match(row_path, static_path, wildkey):
