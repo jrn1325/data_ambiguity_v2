@@ -13,6 +13,7 @@ JSON_FOLDER = os.path.expanduser("~/Desktop/jsons")
 PROCESSED_SCHEMAS_FOLDER = "processed_schemas"
 PROCESSED_JSONS_FOLDER = "processed_jsons"
 
+
 def load_schema(schema_path):
     """
     Load the schema from the path.
@@ -28,7 +29,7 @@ def load_schema(schema_path):
             schema = json.load(schema_file)
             return schema
     except Exception as e:
-        print(f"Error loading schema {schema_path}: {e}")
+        print(f"Error loading schema {schema_path}: {e}", flush=True)
         return None
 
 
@@ -61,13 +62,13 @@ def load_and_dereference_schema(schema_path):
             return resolved_schema
 
     except jsonref.JsonRefError as e:
-        print(f"Error dereferencing schema {schema_path}: {e}")
+        print(f"Error dereferencing schema {schema_path}: {e}", flush=True)
         return None
     except ValueError as e:
-        print(f"Error parsing schema {schema_path}: {e}")
+        print(f"Error parsing schema {schema_path}: {e}", flush=True)
         return None
     except Exception as e:
-        print(f"Unknown error dereferencing schema {schema_path}: {e}")
+        print(f"Unknown error dereferencing schema {schema_path}: {e}", flush=True)
         return None
 
         
@@ -150,36 +151,27 @@ def validate_all_documents(dataset_path, modified_schema):
     all_docs = []
     invalid_docs_count = 0
 
-    try:
-        cls = validator_for(modified_schema)
-        cls.check_schema(modified_schema)
-        validator = cls(modified_schema)
+    cls = validator_for(modified_schema)
+    cls.check_schema(modified_schema)
+    validator = cls(modified_schema)
 
-        # Process each document in the dataset
-        with open(dataset_path, 'r') as file:
-            for line in file:
-                try:
-                    doc = json.loads(line)                    
-                    all_docs.append(doc)
+    # Process each document in the dataset
+    with open(dataset_path, 'r') as file:
+        for line in file:
+            try:
+                doc = json.loads(line)                    
+                all_docs.append(doc)
 
-                    # Validate the document against the modified schema
-                    errors = list(validator.iter_errors(doc))
-                    # Keep track of the number of invalid documents
-                    if errors:
-                        invalid_docs_count += 1
-
-                except json.JSONDecodeError as e:
-                    print(f"Error parsing JSON document in {dataset_path}: {e}")
+                # Validate the document against the modified schema
+                errors = list(validator.iter_errors(doc))
+                # Keep track of the number of invalid documents
+                if errors:
                     invalid_docs_count += 1
-                    continue
-                except Exception as e:
-                    print(f"Error validating document in {dataset_path}: {e}")
-                    invalid_docs_count += 1
-                    continue
-        return all_docs, invalid_docs_count
-    except Exception as e:
-        print(f"Error validating schema {dataset_path}: {e}")
-        return all_docs, invalid_docs_count
+            except Exception as e:
+                print(f"Error validating document in {dataset_path}: {e}", flush=True)
+                invalid_docs_count += 1
+                continue
+    return all_docs, invalid_docs_count
 
 
 def recreate_directory(directory_path):
@@ -207,16 +199,15 @@ def save_json_schema(content, dataset):
     try:
         json_content = json.dumps(content, indent=4)
     except TypeError as e:
-        print(f"Error serializing JSON for {dataset}: {e}")
+        print(f"Error serializing JSON for {dataset}: {e}", flush=True)
         return False
 
     try:
         with open(path, 'w') as f:
             f.write(json_content)
-        print(f"Schema successfully saved to {dataset}.")
         return True
     except Exception as e:
-        print(f"Error during file operation for {dataset}: {e}")
+        print(f"Error saving schema for {dataset}: {e}", flush=True)
         return False
 
 
@@ -233,9 +224,8 @@ def save_json_documents(json_docs, dataset):
         with open(path, 'a') as f:
             for doc in json_docs:
                 f.write(json.dumps(doc) + '\n')
-            print(f"Documents successfully saved to {path}.")
     except Exception as e:
-        print(f"Error saving documents to {path}: {e}")
+        print(f"Error saving documents to {path}: {e}", flush=True)
 
 
 def process_single_dataset(dataset):
@@ -299,40 +289,34 @@ def process_single_dataset(dataset):
     
     # Load and dereference the schema
     dereferenced_schema = load_and_dereference_schema(schema_path)
-    if dereferenced_schema is None or type(dereferenced_schema) is not dict:
+    if not isinstance(dereferenced_schema, dict):
         print(f"Skipping {dataset} due to schema dereferencing failure.", flush=True)
         failure_flags["dereferenced"] = 1 
         return failure_flags
-
-    # Make a deep copy of the dereferenced schema for modification
-    copy_dereferenced_schema = deepcopy(dereferenced_schema)
-
+    
     # Try modifying the schema to prevent additional properties
     try:
-        modified_schema = prevent_additional_properties(copy_dereferenced_schema)
-        print(f"Successfully modified schema {dataset}.", flush=True)
+        modified_schema = prevent_additional_properties(deepcopy(dereferenced_schema))
     except Exception as e:
         print(f"Error modifying schema for {dataset}: {e}. Reverting to dereferenced schema.", flush=True)
         failure_flags["modified"] = 1 
+        modified_schema = dereferenced_schema
 
-    # Validate all documents against the modified schema
+    # Validate documents
     all_docs, invalid_docs_count = validate_all_documents(dataset_path, modified_schema)
-    print(f"Out of {len(all_docs)} documents, {invalid_docs_count} are invalid in {schema_path}", flush=True)
-
-    if invalid_docs_count == 0:
-        # Save the schema to the processed_schemas folder
-        if save_json_schema(modified_schema, dataset):
-            # Save JSON lines file with the same name as the schema
-            save_json_documents(all_docs, dataset)
-    else:
-        # Save the schema to the processed_schemas folder
-        if save_json_schema(dereferenced_schema, dataset):
-            # Save JSON lines file with the same name as the schema
-            save_json_documents(all_docs, dataset)
-        failure_flags["validation"] = 1 
-
+    if invalid_docs_count > 0:
+        failure_flags["validation"] = 1
+        
+    print(f"{dataset}: {invalid_docs_count}/{len(all_docs)} documents failed validation.", flush=True)
+    schema_to_save = modified_schema if invalid_docs_count == 0 else dereferenced_schema
+    
+    # Save schema and documents
+    if save_json_schema(schema_to_save, dataset):
+        save_json_documents(all_docs, dataset)
+    
+    
     return failure_flags
-
+    
 
 def process_datasets():
     """
@@ -341,7 +325,7 @@ def process_datasets():
     empty datasets, and skipped datasets. Print the remaining number of schemas after each criterion.
     """
     datasets = os.listdir(SCHEMA_FOLDER)
-    #datasets = ["adonisrc-json.json"]
+    #datasets = ["cspell.json"]
     original_count = len(datasets) 
     
     # Recreate the processed folders
