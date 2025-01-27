@@ -247,8 +247,8 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
 
 def get_static_paths(schema, parent_path=("$",)):
     """
-    Recursively traverse a JSON schema and collect full paths of properties where type is 'object',
-    returning the paths as tuples and excluding paths for dynamic nested keys.
+    Recursively traverse a JSON schema and collect full paths of properties where type is 'object' and 
+    properties does not allow additional properties.
 
     Args:
         schema (dict): The JSON schema.
@@ -266,27 +266,30 @@ def get_static_paths(schema, parent_path=("$",)):
         for prop, prop_schema in schema["properties"].items():
             full_path = parent_path + (prop,)
 
-            if isinstance(prop_schema, dict):
-                # Only yield the path if additionalProperties is explicitly set to False
-                if prop_schema.get("additionalProperties") is False:
-                    yield full_path  # Yield the path for well-defined properties only
+            if isinstance(prop_schema, dict) and prop_schema.get("additionalProperties") is False:
+                yield full_path  # Yield the path for well-defined properties only
                 
-                # Recursively check nested properties
-                yield from get_static_paths(prop_schema, full_path)
+            # Recursively check nested properties
+            yield from get_static_paths(prop_schema, full_path)
 
     # Handle 'items' in arrays
     if "items" in schema:
-        if isinstance(schema["items"], dict):
-            if schema["items"].get("type") == "object" and schema["items"].get("additionalProperties") is False:
-                yield from get_static_paths(schema["items"], parent_path + ("*",))
-
+        items = schema["items"]
+        if isinstance(items, dict):
+            # Recursively process the schema under items
+            yield from get_static_paths(items, parent_path + ("*",))
+        
+        elif isinstance(items, list):
+            # Process each schema in the list under items
+            for index, sub_schema in enumerate(items):
+                yield from get_static_paths(sub_schema, parent_path + ("*",))
 
     # Handle 'additionalProperties'
     if "additionalProperties" in schema:
-        if isinstance(schema["additionalProperties"], dict):
-            if schema["additionalProperties"].get("additionalProperties") is False:
-                yield from get_static_paths(schema["additionalProperties"], parent_path + ("wildkey",))
-        elif schema["additionalProperties"] is False:
+        additional_properties = schema["additionalProperties"]
+        if isinstance(additional_properties, dict):
+            yield from get_static_paths(additional_properties, parent_path + ("wildkey",))
+        elif additional_properties is False:
             yield parent_path
 
     # Handle allOf, anyOf, oneOf
@@ -296,16 +299,17 @@ def get_static_paths(schema, parent_path=("$",)):
                 yield from get_static_paths(sub_schema, parent_path)
 
     # Handle 'patternProperties'
-    if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
-        for pattern, pattern_schema in schema["patternProperties"].items():
-            full_path = parent_path + (pattern,)
-
-            if isinstance(pattern_schema, dict):
+    if "patternProperties" in schema:
+        pattern_properties = schema["patternProperties"]
+        if isinstance(pattern_properties, dict):
+            for pattern, pattern_schema in pattern_properties.items():
+                full_path = parent_path + (pattern,)
+                
                 # If additionalProperties is explicitly False, yield the path
-                if pattern_schema.get("additionalProperties") is False:
+                if isinstance(pattern_schema, dict) and pattern_schema.get("additionalProperties") is False:
                     yield full_path
                 
-                # Recursively check nested properties
+                # Recursively process nested properties
                 yield from get_static_paths(pattern_schema, full_path)
 
     # Handle if-then-else
@@ -331,32 +335,31 @@ def is_path_match(row_path, static_path, wildkey):
     if len(row_path) != len(static_path):
         return False
 
-    # Check for exact match first
-    if row_path == static_path:
-        return True
-
     # Compare each element of the static path with the corresponding element in row path
     for sp, rp in zip(static_path, row_path):
-
         if sp == wildkey:  # Wildkey matches any segment
             continue
 
-        # Check if sp (static path element) is a regex pattern
+        if sp == rp:  # Direct match
+            continue
+
+        # Check if sp is a regex pattern
         if isinstance(sp, str):
             try:
                 # Try regex match
                 if re.fullmatch(sp, rp):
-                    continue  # If regex matches, proceed to the next pair
+                    continue
                 else:
-                    return False  # If regex doesn't match, return False
+                    return False
             except re.error:
-                # If sp is not a valid regex pattern, compare directly
+                # If sp is not a valid regex, compare directly
                 if sp != rp:
                     return False
         else:
-            # Direct comparison for non-string elements (e.g., wildkey or other types)
+            # Direct comparison for non-string elements
             if sp != rp:
                 return False
+
     return True
 
 
@@ -382,7 +385,6 @@ def label_paths(df, static_paths, wildkey="wildkey"):
         for static_path in static_paths:
             if is_path_match(row["path"], static_path, wildkey):
                 df.at[index, "label"] = 0  # Mark as matching static path
-                break  # No need to check other static paths once a match is found
 
     return df
 
