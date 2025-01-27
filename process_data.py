@@ -19,14 +19,13 @@ DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 JSON_FOLDER = "processed_jsons"
 SCHEMA_FOLDER = "processed_schemas"
 
-
-def split_data(train_ratio=0.8, random_value=42):
+def split_data(train_ratio, random_value):
     """
     Split the list of schemas into training and testing sets making sure that schemas from the same source are grouped together.
 
     Args:
-        train_ratio (float, optional): The ratio of schemas to use for training. Defaults to 0.8.
-        random_value (int, optional): The random seed value. Defaults to 42.
+        train_ratio (float, optional): The ratio of schemas to use for training.
+        random_value (int, optional): The random seed value.
 
     Returns:
         tuple: A tuple containing the training set and testing set.
@@ -247,77 +246,58 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
 
 def get_static_paths(schema, parent_path=("$",)):
     """
-    Recursively traverse a JSON schema and collect full paths of properties where type is 'object' and 
-    properties does not allow additional properties.
+    Recursively traverse a JSON schema and collect full paths of properties where
+    'additionalProperties' is explicitly set to False.
 
     Args:
         schema (dict): The JSON schema.
         parent_path (tuple): The current path accumulated as a tuple (default is the root).
 
     Returns:
-        A generator yielding full paths of object-type properties as tuples.
+        generator: A generator yielding full paths of object-type properties as tuples.
     """
     if not isinstance(schema, dict):
         print(f"Skipping invalid schema at path {parent_path}: Expected a dictionary, got {type(schema).__name__}")
         return
-    
+
+    # Check 'additionalProperties' at the current level
+    if schema.get("additionalProperties") is False:
+        yield parent_path
+
     # Handle 'properties'
     if "properties" in schema and isinstance(schema["properties"], dict):
         for prop, prop_schema in schema["properties"].items():
             full_path = parent_path + (prop,)
-
-            if isinstance(prop_schema, dict) and prop_schema.get("additionalProperties") is False:
-                yield full_path  # Yield the path for well-defined properties only
-                
-            # Recursively check nested properties
             yield from get_static_paths(prop_schema, full_path)
 
-    # Handle 'items' in arrays
+    # Handle 'items' for arrays
     if "items" in schema:
         items = schema["items"]
         if isinstance(items, dict):
-            # Recursively process the schema under items
             yield from get_static_paths(items, parent_path + ("*",))
-        
         elif isinstance(items, list):
-            # Process each schema in the list under items
             for index, sub_schema in enumerate(items):
                 yield from get_static_paths(sub_schema, parent_path + ("*",))
 
-    # Handle 'additionalProperties'
-    if "additionalProperties" in schema:
-        additional_properties = schema["additionalProperties"]
-        if isinstance(additional_properties, dict):
-            yield from get_static_paths(additional_properties, parent_path + ("wildkey",))
-        elif additional_properties is False:
-            yield parent_path
+    # Handle 'patternProperties'
+    if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
+        for pattern, pattern_schema in schema["patternProperties"].items():
+            full_path = parent_path + (pattern,)
+            yield from get_static_paths(pattern_schema, full_path)
 
-    # Handle allOf, anyOf, oneOf
+    # Handle schema combiners: allOf, anyOf, oneOf
     for combiner in ["allOf", "anyOf", "oneOf"]:
         if combiner in schema and isinstance(schema[combiner], list):
             for sub_schema in schema[combiner]:
                 yield from get_static_paths(sub_schema, parent_path)
 
-    # Handle 'patternProperties'
-    if "patternProperties" in schema:
-        pattern_properties = schema["patternProperties"]
-        if isinstance(pattern_properties, dict):
-            for pattern, pattern_schema in pattern_properties.items():
-                full_path = parent_path + (pattern,)
-                
-                # If additionalProperties is explicitly False, yield the path
-                if isinstance(pattern_schema, dict) and pattern_schema.get("additionalProperties") is False:
-                    yield full_path
-                
-                # Recursively process nested properties
-                yield from get_static_paths(pattern_schema, full_path)
-
-    # Handle if-then-else
+    # Handle 'if', 'then', and 'else'
     if "if" in schema and isinstance(schema["if"], dict):
         if "then" in schema and isinstance(schema["then"], dict):
             yield from get_static_paths(schema["then"], parent_path)
         if "else" in schema and isinstance(schema["else"], dict):
             yield from get_static_paths(schema["else"], parent_path)
+
 
 
 def is_path_match(row_path, static_path, wildkey):
@@ -517,7 +497,7 @@ def main():
         
         # Preprocess and oversample the training data
         train_df = preprocess_data(train_set)
-        train_df = resample_data(train_df)
+        #train_df = resample_data(train_df)
         train_df = train_df.sort_values(by=["filename", "path"])
         train_df.to_csv("train_data.csv", index=False)
         
