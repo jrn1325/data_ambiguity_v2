@@ -71,20 +71,6 @@ def load_and_dereference_schema(schema_path):
         print(f"Unknown error dereferencing schema {schema_path}: {e}", flush=True)
         return None
 
-        
-def has_pattern_properties_string_search(schema):
-    """
-    Checks if 'patternProperties' exists in the schema by converting it to a string.
-
-    Args:
-        schema (dict): The JSON schema.
-
-    Returns:
-        bool: True if 'patternProperties' is found, False otherwise.
-    """
-    schema_str = json.dumps(schema)
-    return "patternProperties" in schema_str
-
 
 def prevent_additional_properties(schema):
     """
@@ -100,19 +86,24 @@ def prevent_additional_properties(schema):
     if not isinstance(schema, dict):
         return schema
 
-    # Treat the schema as an object if 'type' is 'object' or if 'properties' exist
-    if (schema.get("type") == "object" or "properties" in schema) and "additionalProperties" not in schema:
+    # Treat the schema as an object if it has 'type: object', 'properties', or related keys
+    if (
+        "additionalProperties" not in schema and
+        (schema.get("type") == "object" or "properties" in schema or "required" in schema)
+    ):
         schema["additionalProperties"] = False
+
+    # If additionalProperties is a schema, process it recursively
     elif isinstance(schema.get("additionalProperties"), dict):
         prevent_additional_properties(schema["additionalProperties"])
 
     # Recursively handle 'properties' for object-like schemas
     if "properties" in schema:
-        for value in schema["properties"].values():
+        for key, value in schema["properties"].items():
             if isinstance(value, dict):
                 prevent_additional_properties(value)
 
-    # Recursively handle 'items' for array types
+    # Handle 'items' for array types
     if "items" in schema:
         if isinstance(schema["items"], dict):
             prevent_additional_properties(schema["items"])
@@ -121,8 +112,14 @@ def prevent_additional_properties(schema):
                 if isinstance(item, dict):
                     prevent_additional_properties(item)
 
-    # Handle complex schema keywords
-    for keyword in ["allOf", "anyOf", "oneOf", "not", "if", "then", "else"]:
+    # Handle 'patternProperties' for object-like schemas
+    if "patternProperties" in schema:
+        for pattern, pattern_schema in schema["patternProperties"].items():
+            if isinstance(pattern_schema, dict):
+                prevent_additional_properties(pattern_schema)
+
+    # Handle complex schema keywords like 'allOf', 'anyOf', 'oneOf', 'if', 'then', 'else'
+    for keyword in ["allOf", "anyOf", "oneOf", "if", "then", "else"]:
         if keyword in schema:
             if isinstance(schema[keyword], dict):
                 prevent_additional_properties(schema[keyword])
@@ -131,6 +128,7 @@ def prevent_additional_properties(schema):
                     if isinstance(subschema, dict):
                         prevent_additional_properties(subschema)
 
+    # Return the updated schema
     return schema
 
 
@@ -251,7 +249,6 @@ def process_single_dataset(dataset):
         "exist": 0,
         "empty": 0,
         "loaded": 0,
-        "pattern_properties": 0,
         "dereferenced": 0,
         "modified": 0,
         "validation": 0
@@ -278,14 +275,6 @@ def process_single_dataset(dataset):
         print(f"Failed to load schema for {dataset}.", flush=True)
         failure_flags["loaded"] = 1 
         return failure_flags
-    
-    '''
-    # Check if the schema contains patternProperties
-    if has_pattern_properties_string_search(schema):
-        print(f"Skipping {dataset} due to patternProperties in the schema.", flush=True)
-        failure_flags["pattern_properties"] = 1 
-        return failure_flags
-    '''
     
     # Load and dereference the schema
     dereferenced_schema = load_and_dereference_schema(schema_path)
@@ -314,7 +303,6 @@ def process_single_dataset(dataset):
     if save_json_schema(schema_to_save, dataset):
         save_json_documents(all_docs, dataset)
     
-    
     return failure_flags
     
 
@@ -336,7 +324,6 @@ def process_datasets():
     exist_count = 0
     empty_count = 0
     load_count = 0 
-    pattern_properties_count = 0
     dereference_count = 0
     modify_count = 0
     validation_count = 0
@@ -353,7 +340,6 @@ def process_datasets():
                 exist_count += flags["exist"] 
                 empty_count += flags["empty"]
                 load_count += flags["loaded"]
-                pattern_properties_count += flags["pattern_properties"]
                 validation_count += flags["validation"]
 
                 # Only count dereferencing and modification if the schema had valid documents
@@ -370,9 +356,8 @@ def process_datasets():
     print(f"Remaining after skipping non-existent datasets: {original_count - exist_count}", flush=True)
     print(f"Remaining after removing empty datasets: {original_count - exist_count - empty_count}", flush=True)
     print(f"Remaining after removing schemas failing to load: {original_count - exist_count - empty_count - load_count}", flush=True)
-    print(f"Remaining after removing schemas with patternProperties: {original_count - exist_count - empty_count - load_count - pattern_properties_count}", flush=True)
-    print(f"Remaining after removing schemas failing to dereference: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count}", flush=True)
-    print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - pattern_properties_count - dereference_count - validation_count}", flush=True)
+    print(f"Remaining after removing schemas failing to dereference: {original_count - exist_count - empty_count - load_count - dereference_count}", flush=True)
+    print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - dereference_count - validation_count}", flush=True)
     print(f"Schemas failing to be modified: {modify_count}", flush=True)
 
 
