@@ -229,7 +229,9 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
 
         # Add the parent path length to the schema info
         schema_info["nesting_depth"] = len(path)
-
+        # Calculate type homogeneity (True if all types are the same, False otherwise)
+        schema_info["type_homogeneity"] = len(values_types) == 1
+        schema_info["num_nested_keys"] = len(nested_keys)
         # Calculate datatype and key entropy
         datatype_entropy = 0 if len(values_types) == 1 else 1
         key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
@@ -523,7 +525,7 @@ def main():
         
         # Preprocess and oversample the training data
         train_df = preprocess_data(train_set)
-        #train_df = resample_data(train_df, random_value)
+        train_df = resample_data(train_df, random_value)
         #train_df = train_df.sort_values(by=["filename", "path"])
         train_df.to_csv("train_data.csv", index=False)
         

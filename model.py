@@ -15,7 +15,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Create constant variables
-SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 BATCH_SIZE = 120
 MAX_TOKEN_LEN = 512
@@ -29,21 +28,17 @@ JSON_FOLDER = "processed_jsons"
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
-    def __init__(self, patience=1, min_delta=0):
-        self.patience = patience
+    def __init__(self, tolerance=5, min_delta=0):
+        self.tolerance = tolerance
         self.min_delta = min_delta
         self.counter = 0
-        self.min_validation_loss = float('inf')
+        self.early_stop = False
 
-    def early_stop(self, validation_loss):
-        if validation_loss < self.min_validation_loss:
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        elif validation_loss > (self.min_validation_loss + self.min_delta):
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        return False
+    def __call__(self, train_loss, validation_loss):
+        if (validation_loss - train_loss) > self.min_delta:
+            self.counter +=1
+            if self.counter >= self.tolerance:  
+                self.early_stop = True
 
 class CustomDataset(Dataset):
     def __init__(self, dataframe, tokenizer, max_length=MAX_TOKEN_LEN):
@@ -55,11 +50,11 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        distinct_subkeys = self.data.iloc[idx]["schema"]
+        schema = self.data.iloc[idx]["schema"]
         label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
 
-        tokenized_distinct_subkeys = self.tokenizer(
-            json.dumps(distinct_subkeys),
+        tokenized_schema = self.tokenizer(
+            json.dumps(schema),
             truncation=True,
             padding="max_length",
             return_tensors="pt",
@@ -67,10 +62,11 @@ class CustomDataset(Dataset):
         )
 
         return {
-            "input_ids": tokenized_distinct_subkeys["input_ids"].squeeze(0),
-            "attention_mask": tokenized_distinct_subkeys["attention_mask"].squeeze(0),
+            "input_ids": tokenized_schema["input_ids"].squeeze(0),
+            "attention_mask": tokenized_schema["attention_mask"].squeeze(0),
             "label": label
         }
+
 
 def collate_fn(batch):
     input_ids = torch.stack([item["input_ids"] for item in batch])
@@ -133,7 +129,7 @@ def train_model(train_df, test_df):
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: collate_fn(x))
 
     # Set up scheduler to adjust the learning rate during training
-    num_training_steps = num_epochs * len(train_dataloader)
+    num_training_steps = num_epochs * len(train_dataloader) // accumulation_steps
     num_warmup_steps = int(0.1 * num_training_steps)
     lr_scheduler = get_scheduler(
         "linear",
@@ -142,7 +138,7 @@ def train_model(train_df, test_df):
         num_training_steps=num_training_steps,
     )
 
-    early_stopper = EarlyStopper(patience=1, min_delta=0.005) # training steps if the validation loss does not decrease by at least 0.005 for 1 consecutive epochs
+    early_stopper = EarlyStopper(tolerance=5, min_delta=1)
 
     # Train the model
     model.train()
@@ -153,36 +149,48 @@ def train_model(train_df, test_df):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
             # Forward pass
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-  
-            # Calculate the training loss
             training_loss = outputs.loss
 
             # Need to average the loss if we are using DataParallel
             if training_loss.dim() > 0:
                 training_loss = training_loss.mean()
 
-            training_loss.backward()
+            # Normalize loss for gradient accumulation
+            (training_loss / accumulation_steps).backward()
             
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_dataloader):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+                # Calculate global training step
+                step =+ 1
         
             total_loss += training_loss.item()
         
         average_loss = total_loss / len(train_dataloader)
-        wandb.log({"training_loss": average_loss})
 
         # Test the model
         testing_loss = test_model(test_df, tokenizer, model, device, wandb)
 
-        if early_stopper.early_stop(testing_loss):
+        wandb.log({
+            "training_loss": average_loss,
+            "testing_loss": testing_loss,
+            "learning_rate": lr_scheduler.get_last_lr()[0], 
+            "step": step,
+            "epoch": epoch + 1
+        })
+
+        # early stopping
+        early_stopper(average_loss, testing_loss)
+        if early_stopper.early_stop:
             print(f"Early stopping at epoch {epoch + 1}")
             break
         
     # Save the adapter
-    save_model_and_adapter(model.module)
+    save_model_and_adapter(model)
     wandb.save(f"{PATH}/*")
+    wandb.finish()
 
     
 def test_model(test_df, tokenizer, model, device, wandb):
@@ -205,11 +213,7 @@ def test_model(test_df, tokenizer, model, device, wandb):
             logits = outputs.logits
 
             # Calculate the testing loss
-            testing_loss = outputs.loss
-
-            # Need to average the loss if we are using DataParallel
-            if testing_loss.dim() > 0:
-                testing_loss = testing_loss.mean()
+            testing_loss = outputs.loss.mean()
             total_loss += testing_loss.item()
 
             # Get the actual and predicted labels
@@ -220,24 +224,23 @@ def test_model(test_df, tokenizer, model, device, wandb):
 
     average_loss = total_loss / len(test_loader)
 
+
     # Calculate the accuracy, precision, recall, f1 score of the positive class
-    true_labels_positive, predicted_labels_positive = filter_labels_positive(total_actual_labels, total_predicted_labels)
-    dynamic_accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
-    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    accuracy = accuracy_score(total_actual_labels, total_predicted_labels)
+    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1, average='binary')
+    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1, average='binary')
+    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1, average='binary')
 
-    # Calculate the accuracy, precision, recall, f1 score of the negative class
-    true_labels_negative, predicted_labels_negative = filter_labels_negative(total_actual_labels, total_predicted_labels)
-    static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative)
-    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    
-    #print(f'accuracy: {accuracy}, precision: {precision}, recall: {recall}, F1: {f1}')
-    wandb.log({"dynamic accuracy": dynamic_accuracy, "testing_loss": average_loss, "dynamic precision": dynamic_precision, "dynamic recall": dynamic_recall, "dynamic F1": dynamic_f1})
-    wandb.log({"static accuracy": static_accuracy, "static precision": static_precision, "static recall": static_recall, "static F1": static_f1})
+    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0, average='binary')
+    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0, average='binary')
+    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0, average='binary')
 
+
+    # Log metrics to wandb
+    wandb.log({
+        "static precision": static_precision, "static recall": static_recall, "static F1": static_f1,
+        "accuracy": accuracy, "dynamic precision": dynamic_precision, "dynamic recall": dynamic_recall, "dynamic F1": dynamic_f1
+    })
 
     return average_loss
     
@@ -375,7 +378,8 @@ def save_model_and_adapter(model):
     """
 
     path = os.path.join(os.getcwd(), "adapter-model")
-    
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module    
     # Save the entire model
     model.save_pretrained(path)
 
@@ -421,27 +425,26 @@ def run_jxplain(test_df):
     y_pred = ((test_df["datatype_entropy"] == 0) & (test_df["key_entropy"] > 1)).astype(int)
     y_test = test_df["label"]
 
-    # Calculate overall accuracy
+    # Calculate per-class metrics (separately for static (0) and dynamic (1))
+    precision_0, recall_0, f1_0, _ = precision_recall_fscore_support(y_test, y_pred, average="binary", pos_label=0)
+    precision_1, recall_1, f1_1, _ = precision_recall_fscore_support(y_test, y_pred, average="binary", pos_label=1)
+
+    # Calculate accuracy per class
+    accuracy_0 = accuracy_score(y_test[y_test == 0], y_pred[y_test == 0])  # Accuracy for static class (0)
+    accuracy_1 = accuracy_score(y_test[y_test == 1], y_pred[y_test == 1])  # Accuracy for dynamic class (1)
+
+    # Calculate combined (overall) metrics
+    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(y_test, y_pred, average="macro")
+    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(y_test, y_pred, average="weighted")
     overall_accuracy = accuracy_score(y_test, y_pred)
 
-    # Calculate precision, recall, and F1-score for both classes
-    precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average=None, labels=[0, 1])
-
-    # Calculate combined metrics (macro average)
-    combined_precision, combined_recall, combined_f1, _ = precision_recall_fscore_support(y_test, y_pred, average='weighted')
-
-    # Calculate accuracy for positive and negative classes
-    positive_accuracy = accuracy_score(y_test[y_test == 1], y_pred[y_test == 1])  # Accuracy for positive class
-    negative_accuracy = accuracy_score(y_test[y_test == 0], y_pred[y_test == 0])  # Accuracy for negative class
-
-    # Print performance metrics for the negative class (static)
-    print(f"Class 0 (Static) - Precision: {precision[0]:.4f}, Recall: {recall[0]:.4f}, F1 Score: {f1_score[0]:.4f}, Accuracy: {negative_accuracy:.4f}")
-
-    # Print performance metrics for the positive class (dynamic)
-    print(f"Class 1 (Dynamic) - Precision: {precision[1]:.4f}, Recall: {recall[1]:.4f}, F1 Score: {f1_score[1]:.4f}, Accuracy: {positive_accuracy:.4f}")
+    # Print per-class metrics
+    print(f"Class 0 (Static) - Precision: {precision_0:.4f}, Recall: {recall_0:.4f}, F1 Score: {f1_0:.4f}, Accuracy: {accuracy_0:.4f}")
+    print(f"Class 1 (Dynamic) - Precision: {precision_1:.4f}, Recall: {recall_1:.4f}, F1 Score: {f1_1:.4f}, Accuracy: {accuracy_1:.4f}")
 
     # Print combined metrics
-    print(f"Both Classes (Overall) - Precision: {combined_precision:.4f}, Recall: {combined_recall:.4f}, F1 Score: {combined_f1:.4f}, Accuracy: {overall_accuracy:.4f}")
+    print(f"Overall (Macro) - Precision: {precision_macro:.4f}, Recall: {recall_macro:.4f}, F1 Score: {f1_macro:.4f}, Accuracy: {overall_accuracy:.4f}")
+    print(f"Overall (Weighted) - Precision: {precision_weighted:.4f}, Recall: {recall_weighted:.4f}, F1 Score: {f1_weighted:.4f}, Accuracy: {overall_accuracy:.4f}")
 
 
 
