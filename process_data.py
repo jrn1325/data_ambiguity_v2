@@ -229,12 +229,13 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
 
         # Add the parent path length to the schema info
         schema_info["nesting_depth"] = len(path)
-        # Calculate type homogeneity (True if all types are the same, False otherwise)
-        schema_info["type_homogeneity"] = len(values_types) == 1
         schema_info["num_nested_keys"] = len(nested_keys)
         # Calculate datatype and key entropy
         datatype_entropy = 0 if len(values_types) == 1 else 1
         key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
+        # Add entropy values to the schema info
+        schema_info["datatype_entropy"] = datatype_entropy
+        schema_info["key_entropy"] = key_entropy
 
         # Append a JSON object (dictionary) for this path
         data.append({
@@ -274,8 +275,7 @@ def get_static_paths(schema, parent_path=("$",)):
             yield parent_path  # Disallowing extra properties at this level
         elif isinstance(additional_properties, dict):
             # Recursively traverse the schema under additionalProperties
-            yield from get_static_paths(additional_properties, parent_path + ("wildkey",))
-
+            yield from get_static_paths(additional_properties, parent_path + ("additional_key",))
 
     # Handle 'properties'
     if "properties" in schema and isinstance(schema["properties"], dict):
@@ -291,11 +291,17 @@ def get_static_paths(schema, parent_path=("$",)):
         elif isinstance(items, list):
             for index, sub_schema in enumerate(items):
                 yield from get_static_paths(sub_schema, parent_path + ("*",))
+    # Handle 'prefixItems' for arrays
+    if "prefixItems" in schema:
+        prefix_items = schema["prefixItems"]
+        if isinstance(prefix_items, list):
+            for index, sub_schema in enumerate(prefix_items):
+                yield from get_static_paths(sub_schema, parent_path + ("*",))
     
     # Handle 'patternProperties'
     if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
         for pattern, pattern_schema in schema["patternProperties"].items():
-            full_path = parent_path + (pattern,)
+            full_path = parent_path + ("pattern_key", pattern)
             yield from get_static_paths(pattern_schema, full_path)
     
     # Handle schema combiners: allOf, anyOf, oneOf
@@ -312,90 +318,80 @@ def get_static_paths(schema, parent_path=("$",)):
             yield from get_static_paths(schema["else"], parent_path)
 
 
-def is_path_match(row_path, static_path, wildkey, compiled_regex_cache):
+def compare_paths(json_path, static_path):
     """
-    Check if a given row path matches a static path, considering wildkey and regex patterns.
+    Compare a JSON path with a static path. 'pattern_key' indicates the next element is a regex.
 
     Args:
-        row_path (tuple): The path from the DataFrame row.
-        static_path (tuple): The static path to match against.
-        wildkey (str): The wildkey value used in static paths, which matches any segment.
-        compiled_regex_cache (dict): A cache of pre-compiled regex patterns.
+        json_path (tuple): The JSON path to compare.
+        static_path (tuple): The static path to compare against.
 
     Returns:
-        bool: True if the row_path matches the static_path, False otherwise.
+        bool: True if the paths match, False otherwise.
     """
-    if len(row_path) != len(static_path):
-        return False
+    json_idx, static_idx = 0, 0
+    json_len, static_len = len(json_path), len(static_path)
 
-    for sp, rp in zip(static_path, row_path):
-        if sp == wildkey:  # Wildkey matches any segment
+    while json_idx < json_len and static_idx < static_len:
+        s_key = static_path[static_idx]
+
+        # Handle 'additional_key' (wildcard at this position)
+        if s_key == "additional_key":
+            static_idx += 1  # Move to next static path key
+            json_idx += 1  # Move to next JSON path key
             continue
 
-        if sp == rp:  # Direct match
+        # Handle 'pattern_key' (regex check for the next element)
+        elif s_key == "pattern_key":
+            # Ensure the regex pattern exists in static_path
+            if static_idx + 1 >= static_len or json_idx >= json_len:
+                return False  # Invalid pattern usage
+
+            pattern = static_path[static_idx + 1]  # Regex pattern
+            if not re.fullmatch(pattern, str(json_path[json_idx])):
+                return False  # Pattern did not match
+
+            static_idx += 2  # Move past 'pattern_key' and regex pattern
+            json_idx += 1  # Move past the matched JSON key
             continue
 
-        # Check if sp is a regex pattern and needs to be matched
-        if sp not in compiled_regex_cache:
-            try:
-                compiled_regex_cache[sp] = re.compile(sp)
-            except re.error:
-                # Invalid regex, treat as plain string
-                compiled_regex_cache[sp] = None
-
-        regex = compiled_regex_cache[sp]
-        if regex:
-            if regex.fullmatch(rp):
-                continue
-            else:
-                return False
-        elif sp == rp:
-            continue
-        else:
+        # Handle normal key comparison
+        elif json_path[json_idx] != s_key:
             return False
 
-    return True
+        # Move to the next key in both paths
+        json_idx += 1
+        static_idx += 1
+
+    # Ensure both paths have been fully processed
+    return json_idx == json_len and static_idx == static_len
 
 
-def matches_any_static_path(row_path, static_paths, wildkey, compiled_regex_cache):
+
+def label_paths(df, static_paths):
     """
-    Check if a given row path matches any static path.
+    Label paths in a DataFrame based on their presence in a set of static paths.
 
     Args:
-        row_path (tuple): The path from the DataFrame row.
-        static_paths (set): A set of static paths to compare against.
-        wildkey (str): The wildkey value used in static paths.
-        compiled_regex_cache (dict): A cache of pre-compiled regex patterns.
-
-    Returns:
-        bool: True if the row_path matches any static path, False otherwise.
-    """
-    for static_path in static_paths:
-        if is_path_match(row_path, static_path, wildkey, compiled_regex_cache):
-            return True
-    return False
-
-
-def label_paths(df, static_paths, wildkey="wildkey"):
-    """
-    Efficiently label rows in the DataFrame as:
-    - 0 for static paths and their descendants, including regular expressions.
-    - 1 for paths not matching static paths, treating 'wildkey' as a wildcard.
-
-    Args:
-        df (pd.DataFrame): The DataFrame containing the paths as tuples.
-        static_paths (set): A set of static paths to compare against, potentially including regex patterns.
-        wildkey (str): The wildcard value used in the static paths (default is 'wildkey').
+        df (pd.DataFrame): The DataFrame containing paths to be labeled.
+        static_paths (list): A list of static paths to compare against.
 
     Returns:
         pd.DataFrame: The DataFrame with an additional 'label' column.
     """
-    compiled_regex_cache = {}
-
-    # Apply the `matches_any_static_path` function for each row in the DataFrame
-    df["label"] = df["path"].apply(
-        lambda path: 0 if matches_any_static_path(path, static_paths, wildkey, compiled_regex_cache) else 1
-    )
+    # Initialize 'label' column to 1
+    df["label"] = 1
+    
+    # Iterate through each path in the DataFrame
+    for idx, row in df.iterrows():
+        json_path = row["path"]
+        
+        # Check if the path matches any static path
+        for static_path in static_paths:
+            if compare_paths(json_path, static_path):
+                df.at[idx, "label"] = 0
+                break 
+    
     return df
 
 
@@ -517,26 +513,28 @@ def main():
     try:
         # Parse command-line arguments
         train_size, random_value = sys.argv[-2:]
-        train_ratio = float(train_size)
-        random_value = int(random_value)
-        
-        # Split the data into training and testing sets
-        train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
-        
-        # Preprocess and oversample the training data
-        train_df = preprocess_data(train_set)
-        train_df = resample_data(train_df, random_value)
-        #train_df = train_df.sort_values(by=["filename", "path"])
-        train_df.to_csv("train_data.csv", index=False)
-        
-        # Preprocess the testing data
-        test_df = preprocess_data(test_set)
-        #test_df = test_df.sample(frac=1, random_state=random_value).reset_index(drop=True)
-        test_df.to_csv("test_data.csv", index=False)
-    
-    except (ValueError, IndexError) as e:
-        print(f"Error: {e}\nUsage: script.py <train_size> <random_value>")
+
+    except ValueError:
+        print("Usage: script.py <train_size> <random_value>")
         sys.exit(1)
+
+    train_ratio = float(train_size)
+    random_value = int(random_value)
+    
+    # Split the data into training and testing sets
+    train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
+    
+    # Preprocess and oversample the training data
+    train_df = preprocess_data(train_set)
+    #train_df = resample_data(train_df, random_value)
+    #train_df = train_df.sort_values(by=["filename", "path"])
+    train_df.to_csv("train_data.csv", index=False)
+    
+    # Preprocess the testing data
+    test_df = preprocess_data(test_set)
+    #test_df = test_df.sample(frac=1, random_state=random_value).reset_index(drop=True)
+    test_df.to_csv("test_data.csv", index=False)
+    
     
  
 if __name__ == "__main__":
