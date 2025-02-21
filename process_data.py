@@ -229,13 +229,12 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
 
         # Add the parent path length to the schema info
         schema_info["nesting_depth"] = len(path)
+        # Calculate type homogeneity (True if all types are the same, False otherwise)
+        schema_info["type_homogeneity"] = len(values_types) == 1
         schema_info["num_nested_keys"] = len(nested_keys)
         # Calculate datatype and key entropy
         datatype_entropy = 0 if len(values_types) == 1 else 1
         key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
-        # Add entropy values to the schema info
-        schema_info["datatype_entropy"] = datatype_entropy
-        schema_info["key_entropy"] = key_entropy
 
         # Append a JSON object (dictionary) for this path
         data.append({
@@ -252,7 +251,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
     return df
 
 
-def get_static_paths(schema, parent_path=("$",)):
+def get_static_paths(schema, parent_path=("$",), is_data_level=False):
     """
     Recursively traverse a JSON schema and collect full paths of properties where
     'additionalProperties' is explicitly set to False.
@@ -260,6 +259,7 @@ def get_static_paths(schema, parent_path=("$",)):
     Args:
         schema (dict): The JSON schema.
         parent_path (tuple): The current path accumulated as a tuple (default is the root).
+        is_data_level (bool, optional): Whether we are currently in the data level. Defaults to False.
 
     Returns:
         generator: A generator yielding full paths of object-type properties as tuples.
@@ -275,13 +275,19 @@ def get_static_paths(schema, parent_path=("$",)):
             yield parent_path  # Disallowing extra properties at this level
         elif isinstance(additional_properties, dict):
             # Recursively traverse the schema under additionalProperties
-            yield from get_static_paths(additional_properties, parent_path + ("additional_key",))
+            yield from get_static_paths(additional_properties, parent_path + ("additional_key",), True)
 
     # Handle 'properties'
     if "properties" in schema and isinstance(schema["properties"], dict):
         for prop, prop_schema in schema["properties"].items():
             full_path = parent_path + (prop,)
-            yield from get_static_paths(prop_schema, full_path)
+            yield from get_static_paths(prop_schema, full_path, True)
+
+    # Handle 'patternProperties'
+    if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
+        for pattern, pattern_schema in schema["patternProperties"].items():
+            full_path = parent_path + ("pattern_key", pattern, True)
+            yield from get_static_paths(pattern_schema, full_path)
 
     # Handle 'items' for arrays
     if "items" in schema:
@@ -289,33 +295,27 @@ def get_static_paths(schema, parent_path=("$",)):
         if isinstance(items, dict):
             yield from get_static_paths(items, parent_path + ("*",))
         elif isinstance(items, list):
-            for index, sub_schema in enumerate(items):
-                yield from get_static_paths(sub_schema, parent_path + ("*",))
+            for sub_schema in items:
+                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
     # Handle 'prefixItems' for arrays
     if "prefixItems" in schema:
         prefix_items = schema["prefixItems"]
         if isinstance(prefix_items, list):
-            for index, sub_schema in enumerate(prefix_items):
-                yield from get_static_paths(sub_schema, parent_path + ("*",))
-    
-    # Handle 'patternProperties'
-    if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
-        for pattern, pattern_schema in schema["patternProperties"].items():
-            full_path = parent_path + ("pattern_key", pattern)
-            yield from get_static_paths(pattern_schema, full_path)
+            for sub_schema in prefix_items:
+                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
     
     # Handle schema combiners: allOf, anyOf, oneOf
     for combiner in ["allOf", "anyOf", "oneOf"]:
         if combiner in schema and isinstance(schema[combiner], list):
             for sub_schema in schema[combiner]:
-                yield from get_static_paths(sub_schema, parent_path)
+                yield from get_static_paths(sub_schema, parent_path, is_data_level)
 
     # Handle 'if', 'then', and 'else'
     if "if" in schema and isinstance(schema["if"], dict):
         if "then" in schema and isinstance(schema["then"], dict):
-            yield from get_static_paths(schema["then"], parent_path)
+            yield from get_static_paths(schema["then"], parent_path, is_data_level)
         if "else" in schema and isinstance(schema["else"], dict):
-            yield from get_static_paths(schema["else"], parent_path)
+            yield from get_static_paths(schema["else"], parent_path, is_data_level)
 
 
 def compare_paths(json_path, static_path):
