@@ -526,7 +526,7 @@ def main():
     
     # Preprocess and oversample the training data
     train_df = preprocess_data(train_set)
-    #train_df = resample_data(train_df, random_value)
+    train_df = resample_data(train_df, random_value)
     #train_df = train_df.sort_values(by=["filename", "path"])
     train_df.to_csv("train_data.csv", index=False)
     
