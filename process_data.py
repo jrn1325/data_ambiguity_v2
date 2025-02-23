@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 # Create constant variables
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 JSON_FOLDER = "processed_jsons"
-SCHEMA_FOLDER = "processed_schemas"
+SCHEMA_FOLDER = "converted_processed_schemas"
 
 def split_data(train_ratio, random_value):
     """
@@ -60,7 +60,6 @@ def load_schema(schema_path):
     """
     try:
         with open(schema_path, 'r') as schema_file:
-            # Load the schema from file
             schema = json.load(schema_file)
             return schema
     except json.JSONDecodeError as e:
@@ -69,6 +68,125 @@ def load_schema(schema_path):
         print(f"Error loading schema {schema_path}: {e}", flush=True)
     
     return None
+
+
+def get_static_paths(schema, parent_path=("$",), is_data_level=False):
+    """
+    Recursively traverse a JSON schema and collect full paths of properties where
+    'additionalProperties' is explicitly set to False.
+
+    Args:
+        schema (dict): The JSON schema.
+        parent_path (tuple): The current path accumulated as a tuple (default is the root).
+        is_data_level (bool, optional): Whether we are currently in the data level. Defaults to False.
+
+    Returns:
+        generator: A generator yielding full paths of object-type properties as tuples.
+    """
+    if not isinstance(schema, dict):
+        #print(f"Skipping invalid schema at path {parent_path}: Expected a dictionary, got {type(schema).__name__}")
+        return
+
+    # Check 'additionalProperties' at the current level
+    if "additionalProperties" in schema:
+        additional_properties = schema["additionalProperties"]
+        if additional_properties is False:
+            yield parent_path
+        elif isinstance(additional_properties, dict):
+            # Recursively traverse the schema under additionalProperties
+            yield from get_static_paths(additional_properties, parent_path + ("additional_key",), True)
+
+    # Handle 'properties'
+    if "properties" in schema and isinstance(schema["properties"], dict):
+        for prop, prop_schema in schema["properties"].items():
+            full_path = parent_path + (prop,)
+            yield from get_static_paths(prop_schema, full_path, True)
+
+    # Handle 'patternProperties'
+    if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
+        for pattern, pattern_schema in schema["patternProperties"].items():
+            full_path = parent_path + ("pattern_key" + pattern,)
+            yield from get_static_paths(pattern_schema, full_path, True)
+
+    # Handle 'items' for arrays
+    if "items" in schema:
+        items = schema["items"]
+        if isinstance(items, dict):
+            yield from get_static_paths(items, parent_path + ("*",))
+        elif isinstance(items, list):
+            for sub_schema in items:
+                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
+
+    # Handle 'prefixItems' for arrays
+    if "prefixItems" in schema:
+        prefix_items = schema["prefixItems"]
+        if isinstance(prefix_items, list):
+            for sub_schema in prefix_items:
+                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
+    
+    # Handle schema combiners: allOf, anyOf, oneOf
+    for combiner in ["allOf", "anyOf", "oneOf"]:
+        if combiner in schema and isinstance(schema[combiner], list):
+            for sub_schema in schema[combiner]:
+                yield from get_static_paths(sub_schema, parent_path, is_data_level)
+
+    # Handle 'if', 'then', and 'else'
+    if "if" in schema and isinstance(schema["if"], dict):
+        if "then" in schema and isinstance(schema["then"], dict):
+            yield from get_static_paths(schema["then"], parent_path, is_data_level)
+        if "else" in schema and isinstance(schema["else"], dict):
+            yield from get_static_paths(schema["else"], parent_path, is_data_level)
+
+
+def get_json_format(value):
+    """
+    Determine the JSON data type based on the input value's type.
+
+    Args:
+        value: The value to check.
+
+    Returns:
+        str: The corresponding JSON data type.
+    """
+    # Mapping from Python types to JSON types
+    python_to_json_type = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+        type(None): "null"
+    }
+
+    # Return mapped JSON type or "object" for unknown types
+    return python_to_json_type.get(type(value), "object")
+
+
+def match_properties(schema, document):
+    """
+    Check if there is an intersection between the top-level properties in the schema and the document.
+
+    Args:
+        schema (dict): JSON Schema object.
+        document (dict): JSON object.
+
+    Returns:
+        bool: True if there is an intersection, False otherwise.
+    """
+
+    # Extract top-level schema properties
+    schema_properties = set(schema.get("properties", {}).keys())
+
+    # If there are no top-level properties, return True
+    if not schema_properties:
+        return True
+
+    # Extract top-level document properties
+    document_properties = set(document.keys())
+
+    # Check if there is an intersection
+    return bool(schema_properties & document_properties)
 
 
 def extract_paths(doc, path = ("$",), values = []):
@@ -96,66 +214,6 @@ def extract_paths(doc, path = ("$",), values = []):
         yield path + (key,), value
         if isinstance(value, (dict, list)):
             yield from extract_paths(value, path + (key,), values)
-
-
-def match_properties(schema, document):
-    """Check if there is an intersection between the schema and the document.
-
-    Args:
-        schema (dict): JSON Schema object.
-        document (dict): JSON object.
-
-    Returns:
-        bool: True if there is a match, False otherwise.
-    """
-
-    # Check top-level properties
-    schema_properties = schema.get("properties", {})
-    if any(key in schema_properties for key in document):
-        return True
-
-    # Check patternProperties
-    pattern_properties = schema.get("patternProperties", {})
-    for pattern in pattern_properties:
-        regex = re.compile(pattern)
-        if any(regex.match(key) for key in document):
-            return True
-    
-    # Check conditional subschemas
-    for keyword in ("allOf", "anyOf", "oneOf"):
-        if keyword in schema:
-            subschemas = schema[keyword]
-            for subschema in subschemas:
-                if match_properties(subschema, document):
-                    return True
-    
-    return False
-
-
-def get_json_format(value):
-    """
-    Determine the JSON format type based on the input value's type.
-
-    Args:
-        value: The value to check.
-
-    Returns:
-        str: The corresponding JSON format type.
-    """
-    # Mapping from Python types to JSON types
-    python_to_json_type = {
-        "str": "string",
-        "int": "integer",
-        "float": "number",
-        "bool": "boolean",
-        "list": "array",
-        "dict": "object",
-        "NoneType": "null"
-    }
-
-    # Get the value's type name and map it to the JSON format type
-    value_type = type(value).__name__
-    return python_to_json_type.get(value_type, "unknown") 
 
 
 def process_document(doc, path_types_dict, parent_frequency_dict):
@@ -206,32 +264,40 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
     # Iterate over the paths and their associated nested keys
     for path, nested_keys in path_types_dict.items():
         schema_info = {"properties": {}}
-   
         values_types = set()
         frequencies = []
 
-        # Iterate over subpaths to gather key details
+        # Calculate the parent frequency
+        parent_frequency = parent_frequency_dict.get(path)
+        
+        # Iterate over subpaths to gather nested key details
         for nested_key, nested_key_info in nested_keys.items():
             frequency = nested_key_info["frequency"]
             value_type = nested_key_info["type"]
             values_types.add(json.dumps(list(value_type)))
             frequencies.append(frequency)
 
-            # Calculate the relative frequency
-            parent_frequency = parent_frequency_dict.get(path)
-            relative_frequency = frequency / parent_frequency
-
             # Store the key details in the schema dictionary
             schema_info["properties"][nested_key] = {
-                "relative_frequency": relative_frequency,
+                "occurrence": frequency,
                 "type": value_type
             }
 
-        # Add the parent path length to the schema info
-        schema_info["nesting_depth"] = len(path)
+        # Compute raw nesting depth
+        raw_nesting_depth = len(path) - 1
+
+        # Categorize nesting depth
+        if raw_nesting_depth <= 2:
+            schema_info["depth_level"] = "shallow"
+        elif raw_nesting_depth <= 4:
+            schema_info["depth_level"] = "moderate"
+        else:
+            schema_info["depth_level"] = "deep"
+
         # Calculate type homogeneity (True if all types are the same, False otherwise)
-        schema_info["type_homogeneity"] = len(values_types) == 1
-        schema_info["num_nested_keys"] = len(nested_keys)
+        schema_info["type_entropy"] = len(values_types) == 1
+        schema_info["num_children"] = len(nested_keys)
+
         # Calculate datatype and key entropy
         datatype_entropy = 0 if len(values_types) == 1 else 1
         key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
@@ -242,6 +308,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
             "schema": schema_info,
             "datatype_entropy": datatype_entropy,
             "key_entropy": key_entropy,
+            #"nested_keys": json.dumps(list(nested_keys)),
             "filename": dataset
         })
 
@@ -251,121 +318,32 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
     return df
 
 
-def get_static_paths(schema, parent_path=("$",), is_data_level=False):
-    """
-    Recursively traverse a JSON schema and collect full paths of properties where
-    'additionalProperties' is explicitly set to False.
-
-    Args:
-        schema (dict): The JSON schema.
-        parent_path (tuple): The current path accumulated as a tuple (default is the root).
-        is_data_level (bool, optional): Whether we are currently in the data level. Defaults to False.
-
-    Returns:
-        generator: A generator yielding full paths of object-type properties as tuples.
-    """
-    if not isinstance(schema, dict):
-        print(f"Skipping invalid schema at path {parent_path}: Expected a dictionary, got {type(schema).__name__}")
-        return
-
-    # Check 'additionalProperties' at the current level
-    if "additionalProperties" in schema:
-        additional_properties = schema["additionalProperties"]
-        if additional_properties is False:
-            yield parent_path  # Disallowing extra properties at this level
-        elif isinstance(additional_properties, dict):
-            # Recursively traverse the schema under additionalProperties
-            yield from get_static_paths(additional_properties, parent_path + ("additional_key",), True)
-
-    # Handle 'properties'
-    if "properties" in schema and isinstance(schema["properties"], dict):
-        for prop, prop_schema in schema["properties"].items():
-            full_path = parent_path + (prop,)
-            yield from get_static_paths(prop_schema, full_path, True)
-
-    # Handle 'patternProperties'
-    if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
-        for pattern, pattern_schema in schema["patternProperties"].items():
-            full_path = parent_path + ("pattern_key", pattern, True)
-            yield from get_static_paths(pattern_schema, full_path)
-
-    # Handle 'items' for arrays
-    if "items" in schema:
-        items = schema["items"]
-        if isinstance(items, dict):
-            yield from get_static_paths(items, parent_path + ("*",))
-        elif isinstance(items, list):
-            for sub_schema in items:
-                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
-    # Handle 'prefixItems' for arrays
-    if "prefixItems" in schema:
-        prefix_items = schema["prefixItems"]
-        if isinstance(prefix_items, list):
-            for sub_schema in prefix_items:
-                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
-    
-    # Handle schema combiners: allOf, anyOf, oneOf
-    for combiner in ["allOf", "anyOf", "oneOf"]:
-        if combiner in schema and isinstance(schema[combiner], list):
-            for sub_schema in schema[combiner]:
-                yield from get_static_paths(sub_schema, parent_path, is_data_level)
-
-    # Handle 'if', 'then', and 'else'
-    if "if" in schema and isinstance(schema["if"], dict):
-        if "then" in schema and isinstance(schema["then"], dict):
-            yield from get_static_paths(schema["then"], parent_path, is_data_level)
-        if "else" in schema and isinstance(schema["else"], dict):
-            yield from get_static_paths(schema["else"], parent_path, is_data_level)
-
-
 def compare_paths(json_path, static_path):
     """
-    Compare a JSON path with a static path. 'pattern_key' indicates the next element is a regex.
+    Check if a schema path correctly matches a JSON path, considering
+    'additional_key' and 'pattern_key'.
 
     Args:
-        json_path (tuple): The JSON path to compare.
-        static_path (tuple): The static path to compare against.
+        static_path (tuple): Path extracted from the schema, possibly containing 'additional_key' or 'pattern_key'.
+        json_path (tuple): Path extracted from a JSON document.
 
     Returns:
-        bool: True if the paths match, False otherwise.
+        bool: True if the schema path matches the JSON path, considering regex patterns.
     """
-    json_idx, static_idx = 0, 0
-    json_len, static_len = len(json_path), len(static_path)
+    if len(static_path) != len(json_path):
+        return False
 
-    while json_idx < json_len and static_idx < static_len:
-        s_key = static_path[static_idx]
-
-        # Handle 'additional_key' (wildcard at this position)
-        if s_key == "additional_key":
-            static_idx += 1  # Move to next static path key
-            json_idx += 1  # Move to next JSON path key
+    for schema_part, json_part in zip(static_path, json_path):
+        if schema_part == "additional_key":  # Matches any additional key
             continue
-
-        # Handle 'pattern_key' (regex check for the next element)
-        elif s_key == "pattern_key":
-            # Ensure the regex pattern exists in static_path
-            if static_idx + 1 >= static_len or json_idx >= json_len:
-                return False  # Invalid pattern usage
-
-            pattern = static_path[static_idx + 1]  # Regex pattern
-            if not re.fullmatch(pattern, str(json_path[json_idx])):
-                return False  # Pattern did not match
-
-            static_idx += 2  # Move past 'pattern_key' and regex pattern
-            json_idx += 1  # Move past the matched JSON key
-            continue
-
-        # Handle normal key comparison
-        elif json_path[json_idx] != s_key:
+        elif schema_part.startswith("pattern_key"):  # Matches any key that matches the regex pattern
+            pattern = schema_part[11:]  # Strip 'pattern_key' prefix
+            if not re.fullmatch(pattern, json_part):
+                return False
+        elif schema_part != json_part:  # Direct match of parts
             return False
 
-        # Move to the next key in both paths
-        json_idx += 1
-        static_idx += 1
-
-    # Ensure both paths have been fully processed
-    return json_idx == json_len and static_idx == static_len
-
+    return True
 
 
 def label_paths(df, static_paths):
@@ -467,7 +445,7 @@ def preprocess_data(schema_list):
 
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
-  
+    #datasets = ["read-the-docs.json", "zinoma.json"]
     # Process each dataset in parallel
     with ProcessPoolExecutor() as executor:
         frames = list(tqdm.tqdm(executor.map(process_dataset, datasets), total=len(datasets)))
@@ -526,14 +504,14 @@ def main():
     
     # Preprocess and oversample the training data
     train_df = preprocess_data(train_set)
-    train_df = resample_data(train_df, random_value)
+    #train_df = resample_data(train_df, random_value)
     #train_df = train_df.sort_values(by=["filename", "path"])
-    train_df.to_csv("train_data.csv", index=False)
+    train_df.to_csv("train_data.csv", index=False, sep=";")
     
     # Preprocess the testing data
     test_df = preprocess_data(test_set)
     #test_df = test_df.sample(frac=1, random_state=random_value).reset_index(drop=True)
-    test_df.to_csv("test_data.csv", index=False)
+    test_df.to_csv("test_data.csv", index=False, sep=";")
     
     
  

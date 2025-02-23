@@ -7,7 +7,7 @@ import torch.nn as nn
 import tqdm
 import wandb
 from adapters import AutoAdapterModel
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,  precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,  precision_recall_fscore_support, classification_report
 from torch.utils.data import DataLoader, Dataset
 from transformers import AdamW, AutoTokenizer, get_scheduler
 
@@ -16,29 +16,32 @@ warnings.filterwarnings("ignore")
 
 # Create constant variables
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
-BATCH_SIZE = 120
+BATCH_SIZE = 256
 MAX_TOKEN_LEN = 512
 ADAPTER_NAME = "data_ambiguity"
 MODEL_NAME = "microsoft/codebert-base"
 PATH = "./adapter-model"
 # Use os.path.expanduser to expand '~' to the full home directory path
-SCHEMA_FOLDER = "processed_schemas"
+SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
 
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
-    def __init__(self, tolerance=5, min_delta=0):
-        self.tolerance = tolerance
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
-        self.early_stop = False
-
-    def __call__(self, train_loss, validation_loss):
-        if (validation_loss - train_loss) > self.min_delta:
-            self.counter +=1
-            if self.counter >= self.tolerance:  
-                self.early_stop = True
+        self.min_validation_loss = float('inf')
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
 
 class CustomDataset(Dataset):
     def __init__(self, dataframe, tokenizer, max_length=MAX_TOKEN_LEN):
@@ -93,9 +96,9 @@ def initialize_model():
 
 def train_model(train_df, test_df):
 
-    accumulation_steps = 4
-    learning_rate = 1e-6
-    num_epochs = 75
+    accumulation_steps = 2
+    learning_rate = (1e-5)/4
+    num_epochs = 25
 
     # Start a new wandb run to track this script
     wandb.init(
@@ -124,6 +127,7 @@ def train_model(train_df, test_df):
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    
 
     train_dataset = CustomDataset(train_df, tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: collate_fn(x))
@@ -138,7 +142,8 @@ def train_model(train_df, test_df):
         num_training_steps=num_training_steps,
     )
 
-    early_stopper = EarlyStopper(tolerance=5, min_delta=1)
+    early_stopper = EarlyStopper(patience=3, min_delta=0.005) # training steps if the validation loss does not decrease by at least 0.005 for 1 consecutive epochs
+    step = 0
 
     # Train the model
     model.train()
@@ -164,7 +169,7 @@ def train_model(train_df, test_df):
                 optimizer.zero_grad()
 
                 # Calculate global training step
-                step =+ 1
+                step += 1
         
             total_loss += training_loss.item()
         
@@ -182,9 +187,9 @@ def train_model(train_df, test_df):
         })
 
         # early stopping
-        early_stopper(average_loss, testing_loss)
-        if early_stopper.early_stop:
-            print(f"Early stopping at epoch {epoch + 1}")
+        early_stop = early_stopper.early_stop(testing_loss)
+        if early_stop:
+            print("Early stopping")
             break
         
     # Save the adapter
@@ -225,23 +230,32 @@ def test_model(test_df, tokenizer, model, device, wandb):
     average_loss = total_loss / len(test_loader)
 
 
-    # Calculate the accuracy, precision, recall, f1 score of the positive class
+   # Overall accuracy (computed on all labels)
     accuracy = accuracy_score(total_actual_labels, total_predicted_labels)
-    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1, average='binary')
-    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1, average='binary')
-    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1, average='binary')
 
-    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0, average='binary')
-    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0, average='binary')
-    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0, average='binary')
+    # Metrics for the positive class (1)
+    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
 
+    # Metrics for the negative class (0)
+    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
 
     # Log metrics to wandb
-    wandb.log({
-        "static precision": static_precision, "static recall": static_recall, "static F1": static_f1,
-        "accuracy": accuracy, "dynamic precision": dynamic_precision, "dynamic recall": dynamic_recall, "dynamic F1": dynamic_f1
-    })
+    metrics = {
+        "accuracy": accuracy,
+        "dynamic precision": dynamic_precision,
+        "dynamic recall": dynamic_recall,
+        "dynamic F1": dynamic_f1,
+        "static precision": static_precision,
+        "static recall": static_recall,
+        "static F1": static_f1,
+    }
 
+    # Log metrics to wandb
+    wandb.log(metrics)
     return average_loss
     
 
@@ -458,18 +472,18 @@ def main():
             raise ValueError("Invalid mode. Use 'train' or 'test'.")
         
         if mode == "train":
-            train_df = pd.read_csv(train_data)
-            test_df = pd.read_csv(test_data)
+            train_df = pd.read_csv(train_data, sep=";")
+            test_df = pd.read_csv(test_data, sep=";")
             train_model(train_df, test_df)
         elif mode == "test":
-            test_df = pd.read_csv(test_data)
+            test_df = pd.read_csv(test_data, sep=";")
             evaluate_model(test_df)
         else:
-            test_df = pd.read_csv(test_data)
+            test_df = pd.read_csv(test_data, sep=";")
             run_jxplain(test_df)
 
     except (ValueError, IndexError) as e:
-        print(f"Error: {e}\nUsage: script.py <train_size> <random_value> <mode>")
+        print(f"Error: {e}\nUsage: script.py <train_data> <test_data> <mode>")
         sys.exit(1)
 
 
