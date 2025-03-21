@@ -6,11 +6,22 @@ import os
 import pandas as pd
 import re
 import sys
+import torch
+import torch.multiprocessing as mp
 import tqdm
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from imblearn.over_sampling import RandomOverSampler
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import GroupShuffleSplit
+from transformers import AutoTokenizer, AutoModel
+
+# Load CodeBERT
+tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+model = AutoModel.from_pretrained("microsoft/codebert-base")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device) 
+
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -70,7 +81,30 @@ def load_schema(schema_path):
     return None
 
 
-def get_static_paths(schema, parent_path=("$",), is_data_level=False):
+def resolve_ref(schema, ref_path):
+    """
+    Resolve a $ref within the given schema.
+
+    Args:
+        schema (dict): The JSON schema.
+        ref_path (str): The path to the reference.
+
+    Returns:
+        dict or None: The resolved schema, or None if the reference
+                     is invalid or cannot be resolved.
+    
+    """
+    parts = ref_path.lstrip("#/").split("/")
+    ref_schema = schema
+    for part in parts:
+        if part in ref_schema:
+            ref_schema = ref_schema[part]
+        else:
+            return None
+    return ref_schema
+
+
+def get_static_paths(schema, parent_path=("$",), is_data_level=False, root_schema=None):
     """
     Recursively traverse a JSON schema and collect full paths of properties where
     'additionalProperties' is explicitly set to False.
@@ -78,13 +112,23 @@ def get_static_paths(schema, parent_path=("$",), is_data_level=False):
     Args:
         schema (dict): The JSON schema.
         parent_path (tuple): The current path accumulated as a tuple (default is the root).
-        is_data_level (bool, optional): Whether we are currently in the data level. Defaults to False.
+        is_data_level (bool, optional): Whether we are currently in the data level.
+        root_schema (dict, optional): The root schema to resolve $ref references.
 
     Returns:
         generator: A generator yielding full paths of object-type properties as tuples.
     """
+    if root_schema is None:
+        root_schema = schema
+
     if not isinstance(schema, dict):
-        #print(f"Skipping invalid schema at path {parent_path}: Expected a dictionary, got {type(schema).__name__}")
+        return
+
+    # Resolve $ref if present
+    if "$ref" in schema:
+        ref_schema = resolve_ref(root_schema, schema["$ref"])
+        if ref_schema is not None:
+            yield from get_static_paths(ref_schema, parent_path, is_data_level, root_schema)
         return
 
     # Check 'additionalProperties' at the current level
@@ -93,49 +137,48 @@ def get_static_paths(schema, parent_path=("$",), is_data_level=False):
         if additional_properties is False:
             yield parent_path
         elif isinstance(additional_properties, dict):
-            # Recursively traverse the schema under additionalProperties
-            yield from get_static_paths(additional_properties, parent_path + ("additional_key",), True)
+            yield from get_static_paths(additional_properties, parent_path + ("additional_key",), True, root_schema)
 
     # Handle 'properties'
     if "properties" in schema and isinstance(schema["properties"], dict):
         for prop, prop_schema in schema["properties"].items():
             full_path = parent_path + (prop,)
-            yield from get_static_paths(prop_schema, full_path, True)
+            yield from get_static_paths(prop_schema, full_path, True, root_schema)
 
     # Handle 'patternProperties'
     if "patternProperties" in schema and isinstance(schema["patternProperties"], dict):
         for pattern, pattern_schema in schema["patternProperties"].items():
             full_path = parent_path + ("pattern_key" + pattern,)
-            yield from get_static_paths(pattern_schema, full_path, True)
+            yield from get_static_paths(pattern_schema, full_path, True, root_schema)
 
     # Handle 'items' for arrays
     if "items" in schema:
         items = schema["items"]
         if isinstance(items, dict):
-            yield from get_static_paths(items, parent_path + ("*",))
+            yield from get_static_paths(items, parent_path + ("*",), is_data_level, root_schema)
         elif isinstance(items, list):
             for sub_schema in items:
-                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
+                yield from get_static_paths(sub_schema, parent_path + ("*",), True, root_schema)
 
     # Handle 'prefixItems' for arrays
     if "prefixItems" in schema:
         prefix_items = schema["prefixItems"]
         if isinstance(prefix_items, list):
             for sub_schema in prefix_items:
-                yield from get_static_paths(sub_schema, parent_path + ("*",), True)
-    
+                yield from get_static_paths(sub_schema, parent_path + ("*",), True, root_schema)
+
     # Handle schema combiners: allOf, anyOf, oneOf
     for combiner in ["allOf", "anyOf", "oneOf"]:
         if combiner in schema and isinstance(schema[combiner], list):
             for sub_schema in schema[combiner]:
-                yield from get_static_paths(sub_schema, parent_path, is_data_level)
+                yield from get_static_paths(sub_schema, parent_path, is_data_level, root_schema)
 
     # Handle 'if', 'then', and 'else'
     if "if" in schema and isinstance(schema["if"], dict):
         if "then" in schema and isinstance(schema["then"], dict):
-            yield from get_static_paths(schema["then"], parent_path, is_data_level)
+            yield from get_static_paths(schema["then"], parent_path, is_data_level, root_schema)
         if "else" in schema and isinstance(schema["else"], dict):
-            yield from get_static_paths(schema["else"], parent_path, is_data_level)
+            yield from get_static_paths(schema["else"], parent_path, is_data_level, root_schema)
 
 
 def get_json_format(value):
@@ -155,6 +198,7 @@ def get_json_format(value):
         float: "number",
         bool: "boolean",
         list: "array",
+        set: "array",
         dict: "object",
         type(None): "null"
     }
@@ -179,8 +223,8 @@ def match_properties(schema, document):
     schema_properties = set(schema.get("properties", {}).keys())
 
     # If there are no top-level properties, return True
-    if not schema_properties:
-        return True
+    #if not schema_properties:
+    #    return True
 
     # Extract top-level document properties
     document_properties = set(document.keys())
@@ -189,31 +233,36 @@ def match_properties(schema, document):
     return bool(schema_properties & document_properties)
 
 
-def extract_paths(doc, path = ("$",), values = []):
-    """Get the path of each key and its value from the json documents.
+def extract_paths(doc, path=("$",)):
+    """
+    Get the path of each key and its value from the JSON document.
 
     Args:
-        doc (dict): JSON document.
-        path (tuple, optional): list of keys full path. Defaults to ('$',).
-        values (list, optional): list of keys' values. Defaults to [].
-
-    Raises:
-        ValueError: Returns an error if the json object is not a dict or list
+        doc (dict or list): JSON document to traverse.
+        path (tuple, optional): The current path of keys. Defaults to ("$",).
 
     Yields:
-        dict: list of JSON object key value pairs
+        tuple: A tuple containing the path and the corresponding value.
+
+    Raises:
+        ValueError: If the input document is not a dict or list.
     """
     if isinstance(doc, dict):
-        iterator = doc.items()
+        for key, value in doc.items():
+            current_path = path + (key,)
+            yield current_path, value
+            if isinstance(value, (dict, list)):
+                yield from extract_paths(value, current_path)
+
     elif isinstance(doc, list):
-        iterator = [('*', item) for item in doc] if doc else []
+        for index, item in enumerate(doc):
+            current_path = path + ("*",)
+            yield current_path, item
+            if isinstance(item, (dict, list)):
+                yield from extract_paths(item, current_path)
+
     else:
-        raise ValueError("Expected dict or list, got {}".format(type(doc).__name__))
-  
-    for key, value in iterator:
-        yield path + (key,), value
-        if isinstance(value, (dict, list)):
-            yield from extract_paths(value, path + (key,), values)
+        raise ValueError(f"Expected dict or list, got {type(doc).__name__}")
 
 
 def process_document(doc, path_types_dict, parent_frequency_dict):
@@ -238,12 +287,54 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
             prefix = path[:-1] 
             value_type = get_json_format(value)
 
+            # Ensure path entry exists
+            if prefix not in path_types_dict:
+                path_types_dict[prefix] = {}
+
+            if nested_key not in path_types_dict[prefix]:
+                path_types_dict[prefix][nested_key] = {"frequency": 0, "type": set()}
+
             # Update frequency and type for the nested key
             path_types_dict[prefix][nested_key]["frequency"] += 1
             path_types_dict[prefix][nested_key]["type"].add(value_type)
 
             # Update parent frequency
-            parent_frequency_dict[prefix] += 1
+            parent_frequency_dict[prefix] = parent_frequency_dict.get(prefix, 0) + 1
+
+
+def get_embeddings(nested_keys):
+    """
+    Get the embeddings for the given nested keys using a pre-trained model.
+
+    Args:
+        nested_keys (list): A list of nested keys to get embeddings for.
+
+    Returns:
+        np.ndarray: An array of embeddings for the nested keys.
+    """
+    inputs = tokenizer(nested_keys, padding=True, truncation=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+
+
+def calc_semantic_similarity(nested_keys):
+    """
+    Calculate the average semantic similarity of nested keys based on their embeddings
+
+    Args:
+        nested_keys (dict): A dictionary where keys are nested keys and values are their types.
+
+    Returns:
+        float: The average cosine similarity between the embeddings of the nested keys.
+        
+    """
+    if len(nested_keys) < 2:
+        return 1.0
+    embeddings = get_embeddings(list(nested_keys.keys()))
+    similarity_matrix = cosine_similarity(embeddings)
+    avg_similarity = np.mean(similarity_matrix)
+    return avg_similarity
 
 
 def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
@@ -261,23 +352,21 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
     """
     data = []
 
-    # Iterate over the paths and their associated nested keys
     for path, nested_keys in path_types_dict.items():
+        #if len(nested_keys) < 2:
+        #    continue
         schema_info = {"properties": {}}
         values_types = set()
         frequencies = []
 
-        # Calculate the parent frequency
-        parent_frequency = parent_frequency_dict.get(path)
-        
-        # Iterate over subpaths to gather nested key details
+        parent_frequency = parent_frequency_dict.get(path, 0)
+
         for nested_key, nested_key_info in nested_keys.items():
-            frequency = nested_key_info["frequency"]
+            frequency = nested_key_info["frequency"] / parent_frequency if parent_frequency else 0
             value_type = nested_key_info["type"]
             values_types.add(json.dumps(list(value_type)))
             frequencies.append(frequency)
 
-            # Store the key details in the schema dictionary
             schema_info["properties"][nested_key] = {
                 "occurrence": frequency,
                 "type": value_type
@@ -287,20 +376,21 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
         raw_nesting_depth = len(path) - 1
 
         # Categorize nesting depth
-        if raw_nesting_depth <= 2:
+        if raw_nesting_depth <= 3:
             schema_info["depth_level"] = "shallow"
-        elif raw_nesting_depth <= 4:
+        elif raw_nesting_depth <= 6:
             schema_info["depth_level"] = "moderate"
         else:
             schema_info["depth_level"] = "deep"
 
-        # Calculate type homogeneity (True if all types are the same, False otherwise)
-        schema_info["type_entropy"] = len(values_types) == 1
-        schema_info["num_children"] = len(nested_keys)
+        # Type homogeneity (Homogeneous if all types are the same, Heterogeneous otherwise)
+        schema_info["datatype_entropy"] = "homogeneous" if len(values_types) == 1 else "heterogeneous"
+        schema_info["num_nested_keys"] = len(nested_keys)
+        schema_info["semantic_similarity"] = calc_semantic_similarity(nested_keys)
 
-        # Calculate datatype and key entropy
+        # Calculate entropy measures
         datatype_entropy = 0 if len(values_types) == 1 else 1
-        key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies)
+        key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies if freq > 0)
 
         # Append a JSON object (dictionary) for this path
         data.append({
@@ -308,7 +398,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
             "schema": schema_info,
             "datatype_entropy": datatype_entropy,
             "key_entropy": key_entropy,
-            #"nested_keys": json.dumps(list(nested_keys)),
+            "parent_frequency": parent_frequency,
             "filename": dataset
         })
 
@@ -316,6 +406,7 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
     df = pd.DataFrame(data)
 
     return df
+
 
 
 def compare_paths(json_path, static_path):
@@ -396,9 +487,9 @@ def process_dataset(dataset):
 
     # Get static paths from the schema
     static_paths = set(get_static_paths(schema))
-    if len(static_paths) == 0:
-        print(f"No static paths extracted from {dataset}.")
-        return None
+    #if len(static_paths) == 0:
+    #    print(f"No static paths extracted from {dataset}.")
+    #    return None
 
     # Load and process the dataset
     dataset_path = os.path.join(JSON_FOLDER, dataset)
@@ -433,7 +524,7 @@ def process_dataset(dataset):
 
 def preprocess_data(schema_list):
     """
-    Preprocess all dataset files in a folder, parallelizing the task across multiple CPUs.
+    Preprocess all dataset files in a folder, processing them sequentially.
 
     Args:
         schema_list (list): List of schema files to use for processing.
@@ -445,13 +536,15 @@ def preprocess_data(schema_list):
 
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
-    #datasets = ["read-the-docs.json", "zinoma.json"]
-    # Process each dataset in parallel
-    with ProcessPoolExecutor() as executor:
-        frames = list(tqdm.tqdm(executor.map(process_dataset, datasets), total=len(datasets)))
 
-    # Filter out any datasets that returned None
-    frames = [df for df in frames if df is not None]
+    # Process each dataset sequentially
+    frames = []
+    sys.stderr.write('Processing datasets sequentially...\n')
+    
+    for dataset in tqdm.tqdm(datasets, total=len(datasets)):
+        df = process_dataset(dataset)  # Process each dataset sequentially
+        if df is not None:
+            frames.append(df)
 
     sys.stderr.write('Merging dataframes...\n')
     df = pd.concat(frames, ignore_index=True)
@@ -504,16 +597,16 @@ def main():
     
     # Preprocess and oversample the training data
     train_df = preprocess_data(train_set)
-    #train_df = resample_data(train_df, random_value)
-    #train_df = train_df.sort_values(by=["filename", "path"])
+    train_df = resample_data(train_df, random_value)
     train_df.to_csv("train_data.csv", index=False, sep=";")
     
     # Preprocess the testing data
     test_df = preprocess_data(test_set)
-    #test_df = test_df.sample(frac=1, random_state=random_value).reset_index(drop=True)
+    test_df = test_df.sample(frac=1, random_state=random_value).reset_index(drop=True)
     test_df.to_csv("test_data.csv", index=False, sep=";")
     
     
  
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
