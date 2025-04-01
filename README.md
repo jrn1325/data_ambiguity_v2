@@ -28,10 +28,10 @@ All their details are in the Pipfile.
 - `processed_jsons/` - Folder containing processed JSON files.
 - `adapter-model/` - Directory where trained adapters are saved.
 
-## Implementation
- Step 1 - **Schema Retrieval**: Fetches schemas and associated documents from a source, enabling subsequent processing.  
- Step 2 - **Data Preparation**: Prepares the retrieved data for use in model training, ensuring it’s properly formatted and cleaned.
- Step 3 - **Model Training & Evaluation**: Supports both training and evaluating the model based on the prepared data, allowing for experimentation and performance tracking.
+## Implementation Steps
+- **Schema Retrieval**: Fetches schemas and associated documents from a source, enabling subsequent processing.  
+- **Data Preparation**: Prepares the retrieved data for use in model training, ensuring it’s properly formatted and cleaned.
+- **Model Training & Evaluation**: Supports both training and evaluating the model based on the prepared data, allowing for experimentation and performance tracking.
 
 ## Model Training
 
