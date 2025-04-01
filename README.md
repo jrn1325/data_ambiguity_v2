@@ -29,9 +29,9 @@ All their details are in the Pipfile.
 - `adapter-model/` - Directory where trained adapters are saved.
 
 ## Implementation
-1 - Run get_data.py to get all the schemas and documents
-2 - Run process_data.py to prepare the data for training
-3 - Run model.py to train or evaluate
+ **Schema Retrieval**: Fetches schemas and associated documents from a source, enabling subsequent processing.  
+ **Data Preparation**: Prepares the retrieved data for use in model training, ensuring it’s properly formatted and cleaned.
+ **Model Training & Evaluation**: Supports both training and evaluating the model based on the prepared data, allowing for experimentation and performance tracking.
 
 ## Model Training
 
