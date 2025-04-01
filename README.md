@@ -104,6 +104,9 @@ Make sure to set up a wandb account and log in before running training.
 
 If multiple GPUs are available, the script automatically distributes training across them using `nn.DataParallel`.
 
+## Datasets
+The dataset is available at: [Zenodo](https://doi.org/10.5281/zenodo.15122044)
+
 ## Notes
 
 - Ensure `torch.cuda.is_available()` returns `True` to leverage GPU acceleration.
