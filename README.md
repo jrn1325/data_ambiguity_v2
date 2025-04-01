@@ -20,12 +20,18 @@ Ensure the following dependencies are installed:
 ```sh
 pip install torch transformers adapter-transformers scikit-learn pandas numpy wandb tqdm
 ```
+All their details are in the Pipfile.
 
 ## Directory Structure
 
 - `converted_processed_schemas/` - Folder containing processed schema files.
 - `processed_jsons/` - Folder containing processed JSON files.
 - `adapter-model/` - Directory where trained adapters are saved.
+
+## Implementation
+1 - Run get_data.py to get all the schemas and documents
+2 - Run process_data.py to prepare the data for training
+3 - Run model.py to train or evaluate
 
 ## Model Training
 
