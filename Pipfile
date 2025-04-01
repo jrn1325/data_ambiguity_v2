@@ -1,0 +1,24 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+numpy = "*"
+pandas = "*"
+scikit-learn = "*"
+adapters = "*"
+torch = "*"
+wandb = "*"
+transformers = "*"
+accelerate = "*"
+jsonref = "*"
+imbalanced-learn = "*"
+jsonschema = "*"
+importlib-resources = "*"
+tqdm = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.8"
