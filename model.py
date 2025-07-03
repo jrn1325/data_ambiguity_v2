@@ -1,3 +1,4 @@
+import ast
 import json
 import numpy as np
 import os
@@ -9,6 +10,8 @@ import torch.nn as nn
 import tqdm
 import wandb
 from adapters import AutoAdapterModel
+from collections import defaultdict
+from copy import deepcopy
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,  precision_recall_fscore_support, classification_report
 from torch.utils.data import DataLoader, Dataset
 from transformers import AdamW, AutoTokenizer, get_linear_schedule_with_warmup
@@ -26,6 +29,10 @@ PATH = "./adapter-model"
 # Use os.path.expanduser to expand '~' to the full home directory path
 SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
+TEMP_FOLDER = "temp_jsons"
+
+RELEVANT_KEYS = {"type", "properties", "items", "required", "additionalProperties", "oneOf", "$ref", "$defs"}
+
 
 # Set the seed value all over the place to make this reproducible.
 seed_val = 42
@@ -79,7 +86,6 @@ class CustomDataset(Dataset):
             "label": label
         }
 
-
 def collate_fn(batch):
     input_ids = torch.stack([item["input_ids"] for item in batch])
     attention_mask = torch.stack([item["attention_mask"] for item in batch])
@@ -91,6 +97,47 @@ def collate_fn(batch):
         "label": labels
     }
 
+class CustomEvalDataset(Dataset):
+    def __init__(self, dataframe, tokenizer, max_length=MAX_TOKEN_LEN):
+        self.data = dataframe
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        path = self.data.iloc[idx]["path"]
+        schema = self.data.iloc[idx]["schema"]
+        label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
+
+        tokenized_schema = self.tokenizer(
+            json.dumps(schema),
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+            max_length=self.max_length
+        )
+
+        return {
+            "input_ids": tokenized_schema["input_ids"].squeeze(0),
+            "attention_mask": tokenized_schema["attention_mask"].squeeze(0),
+            "label": label,
+            "path": path
+        }
+
+def collate_eval_fn(batch):
+    input_ids = torch.stack([item["input_ids"] for item in batch])
+    attention_mask = torch.stack([item["attention_mask"] for item in batch])
+    labels = torch.stack([item["label"] for item in batch])
+    paths = [item["path"] for item in batch]
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "label": labels,
+        "path": paths
+    }
 
 def initialize_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -106,7 +153,6 @@ def initialize_model():
     wandb.watch(model)
 
     return model, tokenizer
-
 
 def train_model(train_df, test_df):
     accumulation_steps = 4
@@ -217,8 +263,6 @@ def train_model(train_df, test_df):
     wandb.save(f"{PATH}/*")
     wandb.finish()
 
-
-    
 def test_model(test_df, tokenizer, model, device, wandb):
     test_dataset = CustomDataset(test_df, tokenizer)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
@@ -279,83 +323,6 @@ def test_model(test_df, tokenizer, model, device, wandb):
     wandb.log(metrics)
     return average_loss
     
-
-def evaluate_model(test_df):
-    """
-    Evaluate the model on the test data.
-
-    Args:
-        test_df (pd.DataFrame): DataFrame containing the test data.
-
-    Returns:
-        float: Average testing loss.
-    """
-    # Load model adapter
-    model, tokenizer = load_model_and_adapter()
-
-    # Use all available GPUs
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    
-    test_dataset = CustomDataset(test_df, tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
-    
-    total_loss = 0.0
-    total_actual_labels = []
-    total_predicted_labels = []
-
-    # Set the model to evaluation mode
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
-            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-            # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-            # Get the probabilities
-            logits = outputs.logits
-
-            # Calculate the testing loss
-            testing_loss = outputs.loss
-
-            # Need to average the loss if we are using DataParallel
-            if testing_loss.dim() > 0:
-                testing_loss = testing_loss.mean()
-            total_loss += testing_loss.item()
-
-            # Get the actual and predicted labels
-            actual_labels = labels.cpu().numpy()
-            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
-            total_actual_labels.extend(actual_labels)
-            total_predicted_labels.extend(predicted_labels)
-
-        average_loss = total_loss / len(test_loader)
-
-    # Calculate the accuracy, precision, recall, f1 score of the positive class
-    true_labels_positive, predicted_labels_positive = filter_labels_positive(total_actual_labels, total_predicted_labels)
-    dynamic_accuracy = accuracy_score(true_labels_positive, predicted_labels_positive)
-    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
-
-    # Calculate the accuracy, precision, recall, f1 score of the negative class
-    true_labels_negative, predicted_labels_negative = filter_labels_negative(total_actual_labels, total_predicted_labels)
-    static_accuracy = accuracy_score(true_labels_negative, predicted_labels_negative)
-    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    
-    print(f"dynamic accuracy: {dynamic_accuracy}, testing_loss: {average_loss}, dynamic precision: {dynamic_precision}, dynamic recall: {dynamic_recall}, dynamic F1: {dynamic_f1}")
-    print(f"static accuracy: {static_accuracy}, testing_loss: {average_loss}, static precision: {static_precision}, static recall: {static_recall}, static F1: {static_f1}")
-
-    return average_loss
-
-
 def filter_labels_positive(true_labels, predicted_labels):
     """
     Filter true and predicted labels for the positive class.
@@ -378,7 +345,6 @@ def filter_labels_positive(true_labels, predicted_labels):
     predicted_labels_positive = [predicted_labels[i] for i in positive_indices]
 
     return true_labels_positive, predicted_labels_positive
-
 
 def filter_labels_negative(true_labels, predicted_labels):
     """
@@ -403,7 +369,6 @@ def filter_labels_negative(true_labels, predicted_labels):
 
     return true_labels_negative, predicted_labels_negative
 
-
 def save_model_and_adapter(model):
     """
     Save the model's adapter and log it as a WandB artifact.
@@ -421,7 +386,6 @@ def save_model_and_adapter(model):
     # Save the adapter
     model.save_adapter(path, ADAPTER_NAME)
     
-
 def load_model_and_adapter():
     """
     Load the model and adapter from the specified path.
@@ -437,11 +401,9 @@ def load_model_and_adapter():
     # Load the adapter from the saved path and activate it
     adapter_name = model.load_adapter(PATH)
     model.set_active_adapters(adapter_name)
-    print(f"Loaded and activated adapter: {adapter_name}")
+    print(f"Loaded and activated adapter: {adapter_name}", flush=True)
     
     return model, tokenizer
-
-
 
 def run_jxplain(test_df):
     """
@@ -458,7 +420,7 @@ def run_jxplain(test_df):
     """
     
     # Perform Jxplain: Predict if a key is dynamic (1) based on entropy conditions
-    y_pred = ((test_df["datatype_entropy"] == 0) & (test_df["key_entropy"] > 1)).astype(int)
+    y_pred = ((test_df["datatype_entropy"] == 1) & (test_df["key_entropy"] > 1)).astype(int)
     y_test = test_df["label"]
 
     # Calculate per-class metrics (returns arrays: [class_0, class_1])
@@ -480,6 +442,231 @@ def run_jxplain(test_df):
     print(f"Overall (Weighted) - Precision: {precision_macro:.4f}, Recall: {recall_macro:.4f}, F1 Score: {f1_macro:.4f}, Accuracy: {accuracy:.4f}")
 
 
+def evaluate_model(test_df):
+    """
+    Evaluate the model on the test data and collect correctly predicted dynamic paths.
+
+    Args:
+        test_df (pd.DataFrame): DataFrame with test examples.
+
+    Returns:
+        dynamic_paths (list): Paths where the model correctly predicted dynamic (label=1).
+    """
+    model, tokenizer = load_model_and_adapter()
+
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    test_dataset = CustomEvalDataset(test_df, tokenizer)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_eval_fn(x))
+
+    dynamic_paths = []
+    index = 0
+
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].to(device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            logits = outputs.logits
+            preds = torch.argmax(logits, dim=1)
+
+            for i in range(len(preds)):
+                true_label = labels[i].item()
+                pred_label = preds[i].item()
+                if pred_label == true_label == 1:
+                    dynamic_paths.append(ast.literal_eval(test_df.iloc[index]["path"]))
+                index += 1
+
+    return dynamic_paths
+
+def strip_schema(schema):
+    """
+    Strip schema to keep only type and nested properties.
+    
+    Args:
+        schema (dict or set): The JSON Schema to be stripped.   
+        
+    Returns:
+        dict: A simplified version of the schema containing only the type and properties.
+    """
+    if isinstance(schema, set):
+        return list(schema)
+    if not isinstance(schema, dict):
+        return schema
+
+    new_schema = {}
+    for key, value in schema.items():
+        if key == "type":
+            new_schema["type"] = list(value) if isinstance(value, set) else value
+        elif key == "properties":
+            new_schema["properties"] = {
+                k: strip_schema(v)
+                for k, v in value.items()
+            }
+    return new_schema
+
+
+def nest_schema(group_df, dynamic_paths=None, abstract_dynamic=True):
+    """
+    Builds a nested JSON Schema from path-level schema fragments.
+
+    Args:
+        group_df (pd.DataFrame): DataFrame with 'path' and 'schema' columns.
+        dynamic_paths (list of tuples): Path *prefixes* to treat as dynamic (excluding final key).
+        abstract_dynamic (bool): Whether to abstract dynamic paths using `additionalProperties`.
+
+    Returns:
+        dict: A nested JSON Schema.
+    """
+    if dynamic_paths is None:
+        dynamic_paths = []
+
+    root = {"type": "object", "properties": {}}
+    dynamic_collected = defaultdict(list)
+
+    for _, row in group_df.iterrows():
+        path = ast.literal_eval(row["path"])
+        schema = strip_schema(ast.literal_eval(row["schema"]))
+
+        prefix = path[:-1]
+        key = path[-1]
+        matched_dynamic = None
+
+        for dp in dynamic_paths:
+            if prefix == dp:
+                matched_dynamic = dp
+                break  # Just find match for now; collect type later if needed
+
+        node = root
+        for i, part in enumerate(path):
+            is_last = (i == len(path) - 1)
+            subpath = path[:i + 1]
+
+            if abstract_dynamic and matched_dynamic and subpath == matched_dynamic + (key,):
+                node.setdefault("properties", {})
+                node["properties"][key] = {
+                    "additionalProperties": {}
+                }
+
+                # Collect the type here, since we’re not going to the leaf
+                dynamic_collected[matched_dynamic].append(schema["properties"].get(key, {}).get("type", "object"))
+                break
+
+            node = node.setdefault("properties", {}).setdefault(part, {"type": "object"})
+
+            if is_last:
+                node.update(schema)
+
+    # Post-process to assign correct type unions to each dynamic key abstraction
+    for dp, types in dynamic_collected.items():
+        node = root
+        for part in dp:
+            node = node.get("properties", {}).get(part, {})
+
+        for key, prop in node.get("properties", {}).items():
+            if "additionalProperties" in prop:
+                all_types = set()
+                for t in types:
+                    if isinstance(t, list):
+                        all_types.update(t)
+                    else:
+                        all_types.add(t)
+                prop["additionalProperties"]["type"] = sorted(all_types)
+
+    return root
+
+
+
+def compare_json_schemas(original_schema, enhanced_schema):
+    """
+    Compare the size of two JSON Schemas in kilobytes (KB).
+
+    Args:
+        original_schema (dict): The original JSON Schema.
+        enhanced_schema (dict): The enhanced JSON Schema.
+
+    Returns:
+        dict: A dictionary containing the size in KB of both schemas.
+    """
+    original_schema_str = json.dumps(original_schema, indent=2)
+    enhanced_schema_str = json.dumps(enhanced_schema, indent=2)
+    #original_schema_str = json.dumps(original_schema, separators=(',', ':'))
+    #enhanced_schema_str = json.dumps(enhanced_schema, separators=(',', ':'))
+
+    comparison = {
+        "kilobytes": {
+            "original_schema": round(len(original_schema_str.encode("utf-8")) / 1024, 2),
+            "enhanced_schema": round(len(enhanced_schema_str.encode("utf-8")) / 1024, 2),
+        }
+    }
+
+    return comparison
+
+def eval_dataset(test_df):
+    results = {}
+    total_original = 0
+    total_enhanced = 0
+    total_reduction = 0
+    count = 0
+
+    for filename, group_df in tqdm.tqdm(
+        test_df.groupby("filename"),
+        desc="Evaluating datasets",
+        total=len(test_df["filename"].unique())
+    ):
+
+        print(f"Evaluating model on: {filename} with {len(group_df)} unique paths", flush=True)
+        dynamic_paths = evaluate_model(group_df)
+
+        original_schema = nest_schema(group_df, dynamic_paths, abstract_dynamic=False)
+        abstracted_schema = nest_schema(group_df, dynamic_paths, abstract_dynamic=True)
+        
+        # Save the original and abstracted schemas to files
+        original_schema_path = os.path.join(TEMP_FOLDER, f"{filename}_original.json")
+        abstracted_schema_path = os.path.join(TEMP_FOLDER, f"{filename}_abstracted.json")
+        with open(original_schema_path, "w") as f:
+            json.dump(original_schema, f, indent=2)
+        with open(abstracted_schema_path, "w") as f:
+            json.dump(abstracted_schema, f, indent=2)
+
+        stats = compare_json_schemas(original_schema, abstracted_schema)
+        results[filename] = stats
+
+        original_kb = stats["kilobytes"]["original_schema"]
+        enhanced_kb = stats["kilobytes"]["enhanced_schema"]
+
+        total_original += original_kb
+        total_enhanced += enhanced_kb
+
+        # Calculate reduction if original size > 0 to avoid division by zero
+        if original_kb > 0:
+            reduction = (original_kb - enhanced_kb) / original_kb
+        else:
+            reduction = 0
+        total_reduction += reduction
+
+        count += 1
+
+    average_stats = {
+        "average_kilobytes": {
+            "original_schema": round(total_original / count, 2) if count > 0 else 0,
+            "enhanced_schema": round(total_enhanced / count, 2) if count > 0 else 0,
+        },
+        "average_reduction": round(total_reduction / count, 4) if count > 0 else 0
+    }
+
+    results["summary"] = average_stats
+
+    print(json.dumps(results, indent=2))
+
+
 
 
 def main():
@@ -488,17 +675,17 @@ def main():
         train_data, test_data, mode = sys.argv[-3:]
 
         # Ensure mode is valid
-        if mode not in {"train", "test", "jxplain"}:
+        if mode not in {"train", "eval", "jxplain"}:
             raise ValueError("Invalid mode. Use 'train' or 'test'.")
         
         if mode == "train":
             train_df = pd.read_csv(train_data, sep=";")
             test_df = pd.read_csv(test_data, sep=";")
             train_model(train_df, test_df)
-        elif mode == "test":
+        elif mode == "eval":
             test_df = pd.read_csv(test_data, sep=";")
-            evaluate_model(test_df)
-        else:
+            eval_dataset(test_df)
+        elif mode == "jxplain":
             test_df = pd.read_csv(test_data, sep=";")
             run_jxplain(test_df)
 
