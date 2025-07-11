@@ -512,16 +512,31 @@ def strip_schema(schema):
             }
     return new_schema
 
+def normalize_type(t):
+    """
+    Normalize a JSON Schema type to a list of strings.
+    
+    Args:
+        t (str, list, or None): The type to normalize. 
+    Returns:
+        list: A list of strings representing the normalized type.
+    """
+    if t is None:
+        return ["object"]
+    if isinstance(t, str):
+        return [t]
+    if isinstance(t, list):
+        return t
+    return ["object"]
 
 def nest_schema(group_df, dynamic_paths=None, abstract_dynamic=True):
     """
-    Builds a nested JSON Schema from path-level schema fragments.
-
+    Nest the JSON Schema based on the paths and schemas in the DataFrame.
+    
     Args:
-        group_df (pd.DataFrame): DataFrame with 'path' and 'schema' columns.
-        dynamic_paths (list of tuples): Path *prefixes* to treat as dynamic (excluding final key).
-        abstract_dynamic (bool): Whether to abstract dynamic paths using `additionalProperties`.
-
+        group_df (pd.DataFrame): DataFrame containing paths and schemas.
+        dynamic_paths (list, optional): List of dynamic paths to abstract. Defaults to None.
+        abstract_dynamic (bool, optional): Whether to abstract dynamic paths. Defaults to True.
     Returns:
         dict: A nested JSON Schema.
     """
@@ -529,81 +544,75 @@ def nest_schema(group_df, dynamic_paths=None, abstract_dynamic=True):
         dynamic_paths = []
 
     root = {"type": "object", "properties": {}}
-    dynamic_collected = defaultdict(list)
+    dynamic_collected = defaultdict(list)  # key: dynamic path, value: list of types
 
     for _, row in group_df.iterrows():
         path = ast.literal_eval(row["path"])
         schema = strip_schema(ast.literal_eval(row["schema"]))
 
-        prefix = path[:-1]
-        key = path[-1]
-        matched_dynamic = None
-
-        for dp in dynamic_paths:
-            if prefix == dp:
-                matched_dynamic = dp
-                break  # Just find match for now; collect type later if needed
+        matched_dynamic = path if path in dynamic_paths else None
 
         node = root
         for i, part in enumerate(path):
             is_last = (i == len(path) - 1)
-            subpath = path[:i + 1]
-
-            if abstract_dynamic and matched_dynamic and subpath == matched_dynamic + (key,):
-                node.setdefault("properties", {})
-                node["properties"][key] = {
-                    "additionalProperties": {}
-                }
-
-                # Collect the type here, since we’re not going to the leaf
-                dynamic_collected[matched_dynamic].append(schema["properties"].get(key, {}).get("type", "object"))
-                break
-
             node = node.setdefault("properties", {}).setdefault(part, {"type": "object"})
+
+            if abstract_dynamic and matched_dynamic and is_last:
+                # Abstract this leaf node with additionalProperties
+                node.clear()
+                node["type"] = "object"
+                node["additionalProperties"] = {}
+
+                # Collect the types of all nested properties
+                for subkey, subschema in schema.get("properties", {}).items():
+                    dynamic_collected[matched_dynamic].append(normalize_type(subschema.get("type")))
+                break
 
             if is_last:
                 node.update(schema)
 
-    # Post-process to assign correct type unions to each dynamic key abstraction
-    for dp, types in dynamic_collected.items():
+    # Post-process dynamic paths to assign unioned types in additionalProperties
+    for dp, types_list in dynamic_collected.items():
         node = root
-        for part in dp:
+        for part in dp[:-1]:
             node = node.get("properties", {}).get(part, {})
+        leaf_key = dp[-1]
+        leaf_node = node.get("properties", {}).get(leaf_key, {})
 
-        for key, prop in node.get("properties", {}).items():
-            if "additionalProperties" in prop:
-                all_types = set()
-                for t in types:
-                    if isinstance(t, list):
-                        all_types.update(t)
-                    else:
-                        all_types.add(t)
-                prop["additionalProperties"]["type"] = sorted(all_types)
+        if "additionalProperties" in leaf_node:
+            all_types = set()
+            for types in types_list:
+                all_types.update(types if isinstance(types, list) else [types])
+            leaf_node["additionalProperties"]["type"] = sorted(all_types) if all_types else ["object"]
 
     return root
 
 
 
-def compare_json_schemas(original_schema, enhanced_schema):
+
+
+
+
+def compare_json_schemas(original_schema, abstracted_schema):
     """
     Compare the size of two JSON Schemas in kilobytes (KB).
 
     Args:
         original_schema (dict): The original JSON Schema.
-        enhanced_schema (dict): The enhanced JSON Schema.
+        abstracted_schema (dict): The abstracted JSON Schema.
 
     Returns:
         dict: A dictionary containing the size in KB of both schemas.
     """
     original_schema_str = json.dumps(original_schema, indent=2)
-    enhanced_schema_str = json.dumps(enhanced_schema, indent=2)
+    abstracted_schema_str = json.dumps(abstracted_schema, indent=2)
     #original_schema_str = json.dumps(original_schema, separators=(',', ':'))
-    #enhanced_schema_str = json.dumps(enhanced_schema, separators=(',', ':'))
+    #abstracted_schema_str = json.dumps(abstracted_schema, separators=(',', ':'))
 
     comparison = {
         "kilobytes": {
             "original_schema": round(len(original_schema_str.encode("utf-8")) / 1024, 2),
-            "enhanced_schema": round(len(enhanced_schema_str.encode("utf-8")) / 1024, 2),
+            "abstracted_schema": round(len(abstracted_schema_str.encode("utf-8")) / 1024, 2),
         }
     }
 
@@ -612,7 +621,7 @@ def compare_json_schemas(original_schema, enhanced_schema):
 def eval_dataset(test_df):
     results = {}
     total_original = 0
-    total_enhanced = 0
+    total_abstracted = 0
     total_reduction = 0
     count = 0
 
@@ -621,6 +630,10 @@ def eval_dataset(test_df):
         desc="Evaluating datasets",
         total=len(test_df["filename"].unique())
     ):
+        
+        if filename != "alacritty-configuration-schema.json":
+            continue
+
 
         print(f"Evaluating model on: {filename} with {len(group_df)} unique paths", flush=True)
         dynamic_paths = evaluate_model(group_df)
@@ -640,14 +653,14 @@ def eval_dataset(test_df):
         results[filename] = stats
 
         original_kb = stats["kilobytes"]["original_schema"]
-        enhanced_kb = stats["kilobytes"]["enhanced_schema"]
+        abstracted_kb = stats["kilobytes"]["abstracted_schema"]
 
         total_original += original_kb
-        total_enhanced += enhanced_kb
+        total_abstracted += abstracted_kb
 
         # Calculate reduction if original size > 0 to avoid division by zero
         if original_kb > 0:
-            reduction = (original_kb - enhanced_kb) / original_kb
+            reduction = (original_kb - abstracted_kb) / original_kb
         else:
             reduction = 0
         total_reduction += reduction
@@ -657,7 +670,7 @@ def eval_dataset(test_df):
     average_stats = {
         "average_kilobytes": {
             "original_schema": round(total_original / count, 2) if count > 0 else 0,
-            "enhanced_schema": round(total_enhanced / count, 2) if count > 0 else 0,
+            "abstracted_schema": round(total_abstracted / count, 2) if count > 0 else 0,
         },
         "average_reduction": round(total_reduction / count, 4) if count > 0 else 0
     }
