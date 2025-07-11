@@ -613,6 +613,7 @@ def compare_json_schemas(original_schema, abstracted_schema):
         "kilobytes": {
             "original_schema": round(len(original_schema_str.encode("utf-8")) / 1024, 2),
             "abstracted_schema": round(len(abstracted_schema_str.encode("utf-8")) / 1024, 2),
+            "reduction": round((len(original_schema_str.encode("utf-8")) - len(abstracted_schema_str.encode("utf-8"))) / len(original_schema_str.encode("utf-8")) * 100, 2) if len(original_schema_str.encode("utf-8")) > 0 else 0
         }
     }
 
@@ -631,8 +632,8 @@ def eval_dataset(test_df):
         total=len(test_df["filename"].unique())
     ):
         
-        if filename != "alacritty-configuration-schema.json":
-            continue
+        #if filename != "alacritty-configuration-schema.json":
+        #    continue
 
 
         print(f"Evaluating model on: {filename} with {len(group_df)} unique paths", flush=True)
