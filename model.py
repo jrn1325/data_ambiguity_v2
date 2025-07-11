@@ -604,10 +604,10 @@ def compare_json_schemas(original_schema, abstracted_schema):
     Returns:
         dict: A dictionary containing the size in KB of both schemas.
     """
-    original_schema_str = json.dumps(original_schema, indent=2)
-    abstracted_schema_str = json.dumps(abstracted_schema, indent=2)
-    #original_schema_str = json.dumps(original_schema, separators=(',', ':'))
-    #abstracted_schema_str = json.dumps(abstracted_schema, separators=(',', ':'))
+    #original_schema_str = json.dumps(original_schema, indent=2)
+    #abstracted_schema_str = json.dumps(abstracted_schema, indent=2)
+    original_schema_str = json.dumps(original_schema, separators=(',', ':'))
+    abstracted_schema_str = json.dumps(abstracted_schema, separators=(',', ':'))
 
     comparison = {
         "kilobytes": {
