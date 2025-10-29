@@ -219,19 +219,51 @@ def discover_schema(value):
     else:
         raise TypeError(f"Unsupported value type: {type(value)}")
 
-def discover_schema_from_values(values):
+def build_schema_for_path(path, values):
     """
-    Infer a JSON schema from a list of JSON values.
+    Build a partial schema for a given JSON path and its associated values.
+    Example path: ('$', 'build', 'gpu')
 
     Args:
-        values (list): List of JSON values.
+        path (tuple): The JSON path as a tuple of keys.
+        values (list): List of JSON string values associated with the path.
     Returns:
-        dict: Inferred JSON schema.
+        dict: Partial JSON schema for the given path.
     """
-    if not values:
+    # Infer schema for the values (structure only)
+    value_schemas = [discover_schema(json.loads(v)) for v in values]
+    value_schema = reduce(merge_schemas, value_schemas)
+
+    # Build hierarchical wrapper for the path
+    schema = deepcopy(value_schema)
+    for key in reversed(path[1:]):  # skip '$' root
+        schema = {
+            "type": "object",
+            "properties": {key: schema},
+            "required": [key],
+        }
+
+    return schema
+
+def discover_schema_from_paths(paths_dict):
+    """
+    Infer a Baazizi-style JSON schema from (path, values) pairs.
+    This preserves full hierarchical structure.
+    """
+    all_schemas = []
+
+    for path, values in paths_dict.items():
+        if not values:
+            continue
+        sub_schema = build_schema_for_path(path, values)
+        all_schemas.append(sub_schema)
+
+    # Merge all partial schemas into one
+    if not all_schemas:
         return {"type": "null"}
-    schemas = [discover_schema(v) for v in values]
-    return reduce(merge_schemas, schemas)
+
+    full_schema = reduce(merge_schemas, all_schemas)
+    return full_schema
 
 def normalize_dynamic_paths(dynamic_paths):
     """
@@ -369,10 +401,7 @@ def main():
         file = file.replace("_results.csv", ".json")
 
         # Initialize schema from all paths
-        all_json_values = []
-        for values in paths_dict.values():
-            all_json_values.extend([json.loads(v) for v in values])
-        schema = discover_schema_from_values(all_json_values)
+        schema = discover_schema_from_paths(paths_dict)
         print(f"Initial schema for {file} inferred.", flush=True)
 
         # Extract dynamic paths and sort bottom-up
