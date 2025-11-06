@@ -1,35 +1,37 @@
+import argparse
 import json
-import jsonref
 import math
 import numpy as np
 import os
 import pandas as pd
 import re
 import sys
+import time
 import torch
 import torch.multiprocessing as mp
 import tqdm
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
 from imblearn.over_sampling import RandomOverSampler
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import GroupShuffleSplit
 from transformers import AutoTokenizer, AutoModel
 
-# Load CodeBERT
-tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-model = AutoModel.from_pretrained("microsoft/codebert-base")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device) 
-
-
 import warnings
 warnings.filterwarnings("ignore")
-
+    
 # Create constant variables
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 JSON_FOLDER = "processed_jsons"
 SCHEMA_FOLDER = "converted_processed_schemas"
+MODEL_NAME = "microsoft/codebert-base"
+
+# Load CodeBERT
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device) 
+
+
 
 def split_data(train_ratio, random_value):
     """
@@ -58,7 +60,6 @@ def split_data(train_ratio, random_value):
 
     return train_set, test_set
     
-
 def load_schema(schema_path):
     """
     Load the schema from the path and resolve $ref pointers.
@@ -79,7 +80,6 @@ def load_schema(schema_path):
         print(f"Error loading schema {schema_path}: {e}", flush=True)
     
     return None
-
 
 def resolve_ref(schema, ref_path):
     """
@@ -102,7 +102,6 @@ def resolve_ref(schema, ref_path):
         else:
             return None
     return ref_schema
-
 
 def get_static_paths(schema, parent_path=("$",), is_data_level=False, root_schema=None):
     """
@@ -180,7 +179,6 @@ def get_static_paths(schema, parent_path=("$",), is_data_level=False, root_schem
         if "else" in schema and isinstance(schema["else"], dict):
             yield from get_static_paths(schema["else"], parent_path, is_data_level, root_schema)
 
-
 def get_json_format(value):
     """
     Determine the JSON data type based on the input value's type.
@@ -206,7 +204,6 @@ def get_json_format(value):
     # Return mapped JSON type or "object" for unknown types
     return python_to_json_type.get(type(value), "object")
 
-
 def match_properties(schema, document):
     """
     Check if there is an intersection between the top-level properties in the schema and the document.
@@ -222,16 +219,14 @@ def match_properties(schema, document):
     # Extract top-level schema properties
     schema_properties = set(schema.get("properties", {}).keys())
 
-    # If there are no top-level properties, return True
-    #if not schema_properties:
-    #    return True
-
     # Extract top-level document properties
     document_properties = set(document.keys())
 
-    # Check if there is an intersection
-    return bool(schema_properties & document_properties)
+    # If schema has no declared properties, treat as wildcard match
+    if not schema_properties:
+        return True
 
+    return bool(schema_properties & document_properties)
 
 def extract_paths(doc, path=("$",)):
     """
@@ -264,30 +259,20 @@ def extract_paths(doc, path=("$",)):
     else:
         raise ValueError(f"Expected dict or list, got {type(doc).__name__}")
 
-
 def process_document(doc, path_types_dict, parent_frequency_dict):
     """
     Extracts paths from the given JSON document and stores them in dictionaries,
     grouping paths that share the same prefix and capturing the frequency and data type of nested keys.
-
-    Args:
-        doc (dict): The JSON document from which paths are extracted.
-        path_types_dict (dict): A dictionary where the keys are path prefixes and 
-                                the values are dictionaries with nested key information 
-                                (frequency and data type).
-        parent_frequency_dict (dict): A dictionary to track the frequency of parent keys.
     """
-    
     for path, value in extract_paths(doc):
         if len(path) > 1:
             nested_key = path[-1]
             if nested_key == "*":
                 continue
 
-            prefix = path[:-1] 
+            prefix = path[:-1]
             value_type = get_json_format(value)
 
-            # Ensure path entry exists
             if prefix not in path_types_dict:
                 path_types_dict[prefix] = {}
 
@@ -298,9 +283,8 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
             path_types_dict[prefix][nested_key]["frequency"] += 1
             path_types_dict[prefix][nested_key]["type"].add(value_type)
 
-            # Update parent frequency
+            # Update parent frequency (number of times this object appears)
             parent_frequency_dict[prefix] = parent_frequency_dict.get(prefix, 0) + 1
-
 
 def get_embeddings(nested_keys):
     """
@@ -317,7 +301,6 @@ def get_embeddings(nested_keys):
         outputs = model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
 
-
 def calc_semantic_similarity(nested_keys):
     """
     Calculate the average semantic similarity of nested keys based on their embeddings
@@ -329,37 +312,29 @@ def calc_semantic_similarity(nested_keys):
         float: The average cosine similarity between the embeddings of the nested keys.
         
     """
-    if len(nested_keys) < 2:
-        return 1.0
-    embeddings = get_embeddings(list(nested_keys.keys()))
+    n_keys = len(nested_keys)
+    if n_keys < 2:
+        return 0.5
+
+    keys = list(nested_keys.keys())
+    embeddings = get_embeddings(keys)
     similarity_matrix = cosine_similarity(embeddings)
-    avg_similarity = np.mean(similarity_matrix)
-    return avg_similarity
 
+    # Exclude diagonal (self-similarity)
+    avg_similarity = (np.sum(similarity_matrix) - n_keys) / (n_keys * (n_keys - 1))
+    return round(avg_similarity, 3)
 
-def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
-    """
-    Create a DataFrame from dictionaries containing path and their nested key information.
-
-    Args:
-        path_types_dict (dict): A dictionary containing frequency and type information for each nested key's value.
-        parent_frequency_dict (dict): A dictionary with the frequency of parent keys.
-        dataset (str): The name of the dataset.
-        num_docs (int): The number of documents in the dataset.
-
-    Returns:
-        pd.DataFrame: A DataFrame with 'path', 'schema', and 'filename' columns, with additional columns for entropy.
-    """
+def create_dataframe(path_types_dict, parent_frequency_dict, dataset):
     data = []
 
     for path, nested_keys in path_types_dict.items():
-        #if len(nested_keys) < 2:
-        #    continue
         schema_info = {"properties": {}}
         values_types = set()
         frequencies = []
 
         parent_frequency = parent_frequency_dict.get(path, 0)
+        observed_keys = set(nested_keys.keys())
+        required_keys = []
 
         for nested_key, nested_key_info in nested_keys.items():
             frequency = nested_key_info["frequency"] / parent_frequency if parent_frequency else 0
@@ -368,45 +343,45 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs):
             frequencies.append(frequency)
 
             schema_info["properties"][nested_key] = {
-                "occurrence": frequency,
+                "frequency": round(frequency, 3),
                 "type": value_type
             }
 
-        # Compute raw nesting depth
-        raw_nesting_depth = len(path) - 1
+            # Required if appears in every parent occurrence
+            if nested_key_info["frequency"] == parent_frequency:
+                required_keys.append(nested_key)
 
-        # Categorize nesting depth
-        if raw_nesting_depth <= 3:
-            schema_info["depth_level"] = "shallow"
-        elif raw_nesting_depth <= 6:
-            schema_info["depth_level"] = "moderate"
-        else:
-            schema_info["depth_level"] = "deep"
+        # Compute additionalProperties
+        additional_properties = len(observed_keys - set(required_keys)) > 0
 
-        # Type homogeneity (Homogeneous if all types are the same, Heterogeneous otherwise)
-        schema_info["datatype_entropy"] = "homogeneous" if len(values_types) == 1 else "heterogeneous"
+        schema_info["required"] = required_keys
+        schema_info["additionalProperties"] = additional_properties
+
+        # Derived info
+        schema_info["nesting_depth"] = len(path) - 1
+        schema_info["datatype_entropy"] = 0 if len(values_types) == 1 else 1
         schema_info["num_nested_keys"] = len(nested_keys)
         schema_info["semantic_similarity"] = calc_semantic_similarity(nested_keys)
 
-        # Calculate entropy measures
-        datatype_entropy = 0 if len(values_types) == 1 else 1
-        key_entropy = -sum((freq / num_docs) * math.log(freq / num_docs) for freq in frequencies if freq > 0)
+        # Key entropy
+        if frequencies:
+            total_freq = sum(frequencies)
+            probs = [f / total_freq for f in frequencies if f > 0]
+            key_entropy = -sum(p * math.log(p) for p in probs)
+        else:
+            key_entropy = 0
 
-        # Append a JSON object (dictionary) for this path
         data.append({
             "path": path,
             "schema": schema_info,
-            "datatype_entropy": datatype_entropy,
-            "key_entropy": key_entropy,
+            "datatype_entropy": schema_info["datatype_entropy"],
+            "key_entropy": round(key_entropy, 3),
             "parent_frequency": parent_frequency,
             "filename": dataset
         })
 
-    # Create the DataFrame from the data list
     df = pd.DataFrame(data)
-
     return df
-
 
 
 def compare_paths(json_path, static_path):
@@ -436,7 +411,6 @@ def compare_paths(json_path, static_path):
 
     return True
 
-
 def label_paths(df, static_paths):
     """
     Label paths in a DataFrame based on their presence in a set of static paths.
@@ -463,7 +437,6 @@ def label_paths(df, static_paths):
     
     return df
 
-
 def process_dataset(dataset):
     """
     Process and extract data from the documents, and return a DataFrame.
@@ -487,9 +460,6 @@ def process_dataset(dataset):
 
     # Get static paths from the schema
     static_paths = set(get_static_paths(schema))
-    #if len(static_paths) == 0:
-    #    print(f"No static paths extracted from {dataset}.")
-    #    return None
 
     # Load and process the dataset
     dataset_path = os.path.join(JSON_FOLDER, dataset)
@@ -515,12 +485,11 @@ def process_dataset(dataset):
         print(f"No paths of type object extracted from {dataset}.")
         return None
     
-    df = create_dataframe(path_types_dict, parent_frequency_dict, dataset, num_docs)
+    df = create_dataframe(path_types_dict, parent_frequency_dict, dataset)
     print(f"Dataset: {dataset}, Total Paths: {len(df)}, Static Paths: {len(static_paths)}", flush=True)
     df = label_paths(df, static_paths)
         
     return df
-
 
 def preprocess_data(schema_list):
     """
@@ -537,12 +506,11 @@ def preprocess_data(schema_list):
     # Filter datasets to only include files that match those in schema_list
     datasets = [dataset for dataset in datasets if dataset in schema_list]
 
-    # Process each dataset sequentially
     frames = []
     sys.stderr.write('Processing datasets sequentially...\n')
     
     for dataset in tqdm.tqdm(datasets, total=len(datasets)):
-        df = process_dataset(dataset)  # Process each dataset sequentially
+        df = process_dataset(dataset)  
         if df is not None:
             frames.append(df)
 
@@ -550,7 +518,6 @@ def preprocess_data(schema_list):
     df = pd.concat(frames, ignore_index=True)
 
     return df
-
 
 def resample_data(df, random_value):
     """
@@ -579,11 +546,18 @@ def resample_data(df, random_value):
 
     return df_resampled
 
-
 def main():
+    start_time = time.time()
+
     try:
         # Parse command-line arguments
-        train_size, random_value = sys.argv[-2:]
+        parser = argparse.ArgumentParser()
+        parser.add_argument("train_size", type=float)
+        parser.add_argument("random_value", type=int)
+        args = parser.parse_args()
+
+        train_size = args.train_size
+        random_value = args.random_value
 
     except ValueError:
         print("Usage: script.py <train_size> <random_value>")
@@ -594,17 +568,18 @@ def main():
     
     # Split the data into training and testing sets
     train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
-    
-    # Preprocess and oversample the training data
+
+    # Preprocess the training data
     train_df = preprocess_data(train_set)
-    train_df = resample_data(train_df, random_value)
+    #train_df = resample_data(train_df, random_value)
     train_df.to_csv("train_data.csv", index=False, sep=";")
     
     # Preprocess the testing data
     test_df = preprocess_data(test_set)
-    test_df = test_df.sample(frac=1, random_state=random_value).reset_index(drop=True)
     test_df.to_csv("test_data.csv", index=False, sep=";")
-    
+
+    end_time = time.time()
+    print(f"Processing time: {end_time - start_time:.2f} seconds", flush=True)
     
  
 if __name__ == "__main__":
