@@ -70,7 +70,7 @@ def process_dataset(dataset):
     """Process a JSON dataset, deduplicate docs, and extract path info."""
     paths_dict = defaultdict(list)
     path_freqs = Counter()
-    paths_seen = defaultdict(set)  # For efficient unique value tracking
+    paths_seen = defaultdict(set)
     num_docs = 0
     seen_hashes = set()
 
@@ -333,23 +333,228 @@ def finalize_schema(schema):
     return dedupe_schema(schema)
 
 def build_schema_for_path(path, values):
-    """Build a partial schema for a given path and list of JSON string values."""
+    """
+    Build a schema for a given path and list of JSON string values.
+    Avoids artificial object wrapping that creates unnecessary anyOfs.
+    """
+    # Infer schema for all values at this path
     value_schemas = [discover_schema(json.loads(v)) for v in values]
-    value_schema = reduce(merge_schemas, value_schemas)
-    schema = deepcopy(value_schema)
-    for key in reversed(path[1:]):
-        schema = {"type": "object", "properties": {key: schema}}
+    merged_schema = reduce(merge_schemas, value_schemas)
+
+    # Only wrap intermediate keys in objects if path length > 1
+    for key in path[1:-1]:
+        merged_schema = {
+            "type": "object",
+            "properties": {key: merged_schema},
+            "required": [key],
+            "additionalProperties": False
+        }
+
+    return merged_schema
+
+def insert_schema_at_path(root, path, value_schema):
+    """Insert a value schema into the root schema following the given path safely."""
+    current = root
+    for key in path[1:]:  # skip "$"
+        if key == "*":
+            # Current must become an array
+            if current.get("type") != "array":
+                current.clear()
+                current.update({"type": "array", "items": {}})
+            current = current["items"]
+        else:
+            if current.get("type") != "object":
+                current.clear()
+                current.update({"type": "object", "properties": {}})
+            props = current.setdefault("properties", {})
+            if key not in props:
+                props[key] = {}
+            current = props[key]
+
+    # Merge the leaf schema safely
+    if current:
+        # Only merge if current is not empty
+        merged = merge_schemas(current, value_schema)
+        current.clear()
+        current.update(merged)
+    else:
+        # If empty, just set it
+        current.update(value_schema)
+
+def collect_subobjects(schema, path=()):
+    """
+    Traverse schema and collect object sub-schemas, handling arrays ('*').
+    Returns:
+        hash_to_paths: {hash: list of paths where this schema appears}
+        hash_to_schema: {hash: schema object}
+    """
+    hash_to_paths = defaultdict(list)
+    hash_to_schema = {}
+
+    if not isinstance(schema, dict):
+        return hash_to_paths, hash_to_schema
+
+    schema_type = schema.get("type")
+    if schema_type == "object" and "properties" in schema:
+        canonical = json.dumps(canonicalize_schema(schema), sort_keys=True)
+        h = hashlib.md5(canonical.encode()).hexdigest()
+        hash_to_paths[h].append(path)
+        hash_to_schema[h] = schema
+
+        for key, val in schema["properties"].items():
+            child_paths, child_schemas = collect_subobjects(val, path + (key,))
+            for k, v in child_paths.items():
+                hash_to_paths[k].extend(v)
+            hash_to_schema.update(child_schemas)
+
+    elif schema_type == "array" and "items" in schema:
+        child_paths, child_schemas = collect_subobjects(schema["items"], path + ("*",))
+        for k, v in child_paths.items():
+            hash_to_paths[k].extend(v)
+        hash_to_schema.update(child_schemas)
+
+    for key in ("anyOf", "oneOf"):
+        if key in schema and isinstance(schema[key], list):
+            for idx, s in enumerate(schema[key]):
+                child_paths, child_schemas = collect_subobjects(s, path + (f"{key}[{idx}]",))
+                for k, v in child_paths.items():
+                    hash_to_paths[k].extend(v)
+                hash_to_schema.update(child_schemas)
+
+    return hash_to_paths, hash_to_schema
+
+def replace_with_refs(schema, definitions, hash_to_defname):
+    """
+    Recursively replace sub-schemas with $ref to definitions.
+    Handles arrays with heterogeneous items safely.
+    """
+    if isinstance(schema, list):
+        return [replace_with_refs(s, definitions, hash_to_defname) for s in schema]
+
+    if not isinstance(schema, dict):
+        return schema
+
+    # Already a $ref? return as-is
+    if "$ref" in schema and isinstance(schema["$ref"], str):
+        return schema
+
+    # Check if this schema matches any definition
+    canonical = json.dumps(canonicalize_schema(schema), sort_keys=True)
+    for h, def_name in hash_to_defname.items():
+        def_canonical = json.dumps(canonicalize_schema(definitions[def_name]), sort_keys=True)
+        if canonical == def_canonical:
+            return {"$ref": f"#/$defs/{def_name}"}
+
+    # Recurse into object properties
+    if schema.get("type") == "object" and "properties" in schema:
+        schema["properties"] = {k: replace_with_refs(v, definitions, hash_to_defname)
+                                for k, v in schema["properties"].items()}
+
+    # Recurse into arrays
+    if schema.get("type") == "array" and "items" in schema:
+        schema["items"] = replace_with_refs(schema["items"], definitions, hash_to_defname)
+
+    # Recurse into anyOf / oneOf
+    for key in ("anyOf", "oneOf"):
+        if key in schema and isinstance(schema[key], list):
+            schema[key] = [replace_with_refs(s, definitions, hash_to_defname) for s in schema[key]]
+
     return schema
 
-def discover_schema_from_paths(paths_dict, path_freqs, num_docs):
-    """Infer full schema from paths/values and add required/additionalProperties."""
-    all_schemas = [build_schema_for_path(p, v) for p, v in paths_dict.items() if v]
-    if not all_schemas:
-        return {"type": "null"}
-    full_schema = reduce(merge_schemas, all_schemas)
-    full_schema = add_required_and_additional_properties(full_schema, path_freqs)
-    return finalize_schema(full_schema)
+def collect_used_refs(schema, used_defs):
+    """Traverse schema to collect all $ref names used safely."""
+    if isinstance(schema, dict):
+        ref = schema.get("$ref")
+        if isinstance(ref, str):
+            used_defs.add(ref.split("/")[-1])
+        for v in schema.values():
+            collect_used_refs(v, used_defs)
+    elif isinstance(schema, list):
+        for item in schema:
+            collect_used_refs(item, used_defs)
 
+def discover_schema_from_paths(paths_dict, path_freqs, num_docs):
+    """Infer full schema from paths/values using a single root object."""
+    root_schema = {"type": "object", "properties": {}}
+
+    for path, values in paths_dict.items():
+        if not values:
+            continue
+        # Discover schema for all observed values at this path
+        value_schemas = [discover_schema(json.loads(v)) for v in values]
+        value_schema = reduce(merge_schemas, value_schemas)
+        insert_schema_at_path(root_schema, path, value_schema)
+
+    # Add required/additionalProperties based on path frequencies
+    root_schema = add_required_and_additional_properties(root_schema, path_freqs)
+    # Finalize schema: normalize '*', dedupe anyOf/oneOf, remove temp fields
+    full_schema = finalize_schema(root_schema)
+    hash_to_paths, hash_to_schema = collect_subobjects(full_schema)
+    
+    definitions = {}
+    hash_to_defname = {}
+    for h, paths in hash_to_paths.items():
+        if len(paths) >= 2:
+            def_name = f"Def{len(definitions)+1}"
+            definitions[def_name] = deepcopy(hash_to_schema[h])
+            hash_to_defname[h] = def_name
+
+    if definitions:
+        full_schema = replace_with_refs(full_schema, definitions, hash_to_defname)
+
+        # Remove unused definitions
+        used_defs = set()
+        collect_used_refs(full_schema, used_defs)
+        definitions = {k: v for k, v in definitions.items() if k in used_defs}
+
+        if definitions:
+            full_schema["$defs"] = definitions
+    
+    return full_schema
+
+def schema_to_key(schema):
+    """Return a canonical string for a schema for deduplication."""
+    return json.dumps(schema, sort_keys=True)
+
+def process_schema_node(schema, defs, def_counter):
+    """
+    Recursively process schema node: replace repeated object/array schemas with $ref
+    and collect them into $defs (JSON Schema 2020-12).
+    """
+    if isinstance(schema, dict):
+        node_type = schema.get("type")
+
+        if node_type in ("object", "array"):
+            key = schema_to_key(schema)
+            if key in defs:
+                # Already defined: replace with $ref
+                return {"$ref": f"#/$defs/{defs[key]['name']}"}, defs, def_counter
+
+            # New definition
+            def_name = f"Def{def_counter[0]}"
+            def_counter[0] += 1
+            defs[key] = {"name": def_name, "schema": deepcopy(schema)}
+            return {"$ref": f"#/$defs/{def_name}"}, defs, def_counter
+
+        # Recurse into properties/items/anyOf/oneOf
+        new_schema = {}
+        for k, v in schema.items():
+            if k in ("properties", "items", "anyOf", "oneOf"):
+                new_v, defs, def_counter = process_schema_node(v, defs, def_counter)
+                new_schema[k] = new_v
+            else:
+                new_schema[k] = v
+        return new_schema, defs, def_counter
+
+    elif isinstance(schema, list):
+        new_list = []
+        for item in schema:
+            new_item, defs, def_counter = process_schema_node(item, defs, def_counter)
+            new_list.append(new_item)
+        return new_list, defs, def_counter
+
+    else:
+        return schema, defs, def_counter
 
 def save_schema(schema, path):
     """Save JSON schema to file."""
