@@ -1,104 +1,91 @@
 import argparse
-import ast
 import json
 import hashlib
 import os
-import sys
-import pandas as pd
+import time
 
 from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from functools import reduce
+from tqdm import tqdm
 
 JSON_FOLDER = "processed_jsons"
 
-def parse_document(doc, path = ("$",), values = []):
-    """Get the path of each key and its value from the json documents.
 
-    Args:
-        doc (dict): JSON document.
-        path (tuple, optional): list of keys full path. Defaults to ('$',).
-        values (list, optional): list of keys' values. Defaults to [].
-
-    Raises:
-        ValueError: Returns an error if the json object is not a dict or list
-
-    Yields:
-        dict: list of JSON object key value pairs
-    """
+def parse_document(doc, path=("$",)):
+    """Recursively yield (path, value) pairs for all keys and their values."""
     if isinstance(doc, dict):
-        iterator = doc.items()
+        for key, value in doc.items():
+            current_path = path + (key,)
+            yield current_path, value
+            if isinstance(value, (dict, list)):
+                yield from parse_document(value, current_path)
     elif isinstance(doc, list):
-        iterator = [('*', item) for item in doc] if doc else []
-    else:
-        raise ValueError("Expected dict or list, got {}".format(type(doc).__name__))
-  
-    for key, value in iterator:
-        yield path + (key,), value
-        if isinstance(value, (dict, list)):
-            yield from parse_document(value, path + (key,), values)
+        for item in doc:
+            current_path = path + ("*",)
+            yield current_path, item
+            if isinstance(item, (dict, list)):
+                yield from parse_document(item, current_path)
 
-def process_document(doc, paths_dict, path_freqs):
+def process_document(doc, paths_dict, path_freqs, paths_seen=None):
     """
-    Extracts object-like paths from the given JSON document and stores them in dictionaries,
-    grouping values by paths and tracking path frequency.
+    Extract all paths and their values from a JSON document, tracking frequency.
 
     Args:
-        doc (dict): The JSON document from which paths are extracted.
-        paths_dict (dict): Dictionary mapping each path to a list of values (as JSON strings).
-        path_freqs (Counter): Dictionary tracking how often each path appears.
+        doc (dict | list): JSON document.
+        paths_dict (defaultdict(list)): Maps each path to list of observed values.
+        path_freqs (Counter): Counts occurrences of each path across documents.
+        paths_seen (defaultdict(set), optional): Tracks seen serialized values for efficiency.
     """
+    if paths_seen is None:
+        paths_seen = defaultdict(set)
+
     for path, value in parse_document(doc):
         path_freqs[path] += 1
 
-        if path not in paths_dict:
-            paths_dict[path] = []
+        # Serialize the value
+        if isinstance(value, (dict, list)):
+            try:
+                serialized = json.dumps(value, sort_keys=True)
+            except TypeError:
+                serialized = str(value)
+        else:
+            serialized = json.dumps(value)
 
-        if isinstance(value, dict):
-            value_str = json.dumps(value, sort_keys=True)
-            paths_dict[path].append(value_str)
-
-        elif isinstance(value, list) and all(isinstance(item, dict) for item in value):
-            sorted_list = sorted(
-                [json.dumps(item, sort_keys=True) for item in value]
-            )
-            value_str = json.dumps(sorted_list, sort_keys=True)
-            paths_dict[path].append(value_str)
+        # Only store new values
+        if serialized not in paths_seen[path]:
+            paths_dict[path].append(serialized)
+            paths_seen[path].add(serialized)
 
 def get_doc_hash(doc):
     """Return a hash of the canonical JSON form of the document."""
     try:
         canonical = json.dumps(doc, sort_keys=True)
-        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     except Exception:
         return None
 
 def process_dataset(dataset):
-    """
-    Process and extract object-like paths from a JSON lines dataset, filtering documents
-    by matching schema properties and ignoring duplicate documents.
-
-    Args:
-        dataset (str): The name of the dataset file.
-    Returns:
-        tuple: (paths_dict, num_docs)
-    """
+    """Process a JSON dataset, deduplicate docs, and extract path info."""
     paths_dict = defaultdict(list)
     path_freqs = Counter()
+    paths_seen = defaultdict(set)  # For efficient unique value tracking
     num_docs = 0
     seen_hashes = set()
 
     dataset = dataset.replace("_results.csv", ".json")
     dataset_path = os.path.join(JSON_FOLDER, dataset)
-    with open(dataset_path, 'r') as file:
-        for line_number, line in enumerate(file, 1):
-            try:
-                doc = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"[Line {line_number}] JSON decode error in {dataset}: {e}", flush=True)
-                continue
 
-            try:
+    try:
+        with open(dataset_path, "r") as file:
+            for line_number, line in enumerate(file, 1):
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError as e:
+                    print(f"[Line {line_number}] JSON decode error in {dataset}: {e}", flush=True)
+                    continue
+
                 items = doc if isinstance(doc, list) else [doc]
                 for item in items:
                     if not isinstance(item, dict):
@@ -107,326 +94,320 @@ def process_dataset(dataset):
                     doc_hash = get_doc_hash(item)
                     if doc_hash is None or doc_hash in seen_hashes:
                         continue
+
                     seen_hashes.add(doc_hash)
-                    process_document(item, paths_dict, path_freqs)
+                    process_document(item, paths_dict, path_freqs, paths_seen)
                     num_docs += 1
 
-            except Exception as e:
-                print(f"[Line {line_number}] Error processing document in {dataset}: {e}", flush=True)
+    except FileNotFoundError:
+        print(f"Dataset file not found: {dataset_path}", flush=True)
 
-    return paths_dict, num_docs, dataset
+    return paths_dict, path_freqs, num_docs, dataset
 
-def unique_oneOf(schemas):
-    """
-    Ensures uniqueness in `oneOf` lists by removing duplicates.
-    
-    Args:
-        schemas (list): List of JSON schemas to deduplicate.
-    Returns:
-        list: A list of unique schemas.
-    """
-    serialized = {json.dumps(s, sort_keys=True): s for s in schemas}
-    return list(serialized.values())
 
-def flatten_oneOf(schema):
-    """
-    Flattens nested `oneOf` constructs in a JSON schema.
 
-    Args:
-        schema (dict): A JSON schema.
-    Returns:
-        dict: A flattened JSON schema.
-    """
-    if "oneOf" in schema:
-        result = []
-        for s in schema["oneOf"]:
-            if isinstance(s, dict) and "oneOf" in s:
-                result.extend(flatten_oneOf(s)["oneOf"])
-            else:
-                result.append(s)
-        return {"oneOf": unique_oneOf(result)}
-    return schema
+
+    """Heuristic to allow/disallow additionalProperties."""
+    if total_keys <= 0:
+        return True
+    return not (len(keys) / total_keys >= threshold)
+
+
+def unique_anyOf(schemas):
+    """Deduplicate schemas in an anyOf list."""
+    seen, unique = set(), []
+    for s in schemas:
+        key = json.dumps(s, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    return unique
+
+
+def flatten_anyOf(schema):
+    """Flatten nested anyOf constructs."""
+    if not isinstance(schema, dict) or "anyOf" not in schema:
+        return schema
+
+    result = []
+    for s in schema["anyOf"]:
+        if isinstance(s, dict) and "anyOf" in s:
+            result.extend(flatten_anyOf(s)["anyOf"])
+        else:
+            result.append(s)
+    rest = {k: v for k, v in schema.items() if k != "anyOf"}
+    return {**rest, "anyOf": unique_anyOf(result)}
+
 
 def merge_schemas(schema1, schema2):
-    """
-    Merges two JSON schemas into one.
-
-    Args:
-        schema1 (dict): First JSON schema.
-        schema2 (dict): Second JSON schema.
-    Returns:
-        dict: Merged JSON schema.
-    """
+    """Merge two JSON schemas."""
     if not isinstance(schema1, dict) or not isinstance(schema2, dict):
-        raise TypeError("Both schema1 and schema2 must be dictionaries.")
-    
-    schema1 = flatten_oneOf(schema1)
-    schema2 = flatten_oneOf(schema2)
-    type1 = schema1.get("type")
-    type2 = schema2.get("type")
+        return flatten_anyOf({"anyOf": [schema1, schema2]})
 
-    if type1 == type2:
-        new_schema = deepcopy(schema1)
+    schema1, schema2 = flatten_anyOf(schema1), flatten_anyOf(schema2)
+    type1, type2 = schema1.get("type"), schema2.get("type")
+    if type1 != type2:
+        return flatten_anyOf({"anyOf": [schema1, schema2]})
 
-        if type1 == "object":
-            new_schema["required"] = sorted(set(schema1.get("required", [])) | set(schema2.get("required", [])))
-            for k, v in schema2.get("properties", {}).items():
-                if k in new_schema["properties"]:
-                    new_schema["properties"][k] = merge_schemas(new_schema["properties"][k], v)
-                else:
-                    new_schema["properties"][k] = v
-            return new_schema
+    new_schema = deepcopy(schema1)
 
-        elif type1 == "array" and "items" in schema1 and "items" in schema2:
-            new_schema["items"] = merge_schemas(schema1["items"], schema2["items"])
-            return new_schema
+    if type1 == "object":
+        props1, props2 = schema1.get("properties", {}), schema2.get("properties", {})
+        if "*" in props1 and "*" in props2:
+            return {"type": "array", "items": merge_schemas(props1["*"], props2["*"])}
+        elif "*" in props1 or "*" in props2:
+            return flatten_anyOf({"anyOf": [schema1, schema2]})
+
+        merged_props = deepcopy(props1)
+        for k, v in props2.items():
+            merged_props[k] = merge_schemas(merged_props[k], v) if k in merged_props else v
+        new_schema["properties"] = merged_props
+
+        counts1, counts2 = schema1.get("field_counts", {}), schema2.get("field_counts", {})
+        if counts1 or counts2:
+            merged_counts = deepcopy(counts1)
+            for k, v in counts2.items():
+                merged_counts[k] = merged_counts.get(k, 0) + v
+            new_schema["field_counts"] = merged_counts
+            new_schema["total_count"] = schema1.get("total_count", 0) + schema2.get("total_count", 0)
 
         return new_schema
 
-    return flatten_oneOf({"oneOf": [schema1, schema2]})
+    if type1 == "array":
+        items1, items2 = schema1.get("items", {}), schema2.get("items", {})
+        if all(isinstance(i, dict) and i.get("type") == "object" for i in [items1, items2]):
+            return {"type": "array", "items": merge_schemas(items1, items2)}
+        items1_list = items1.get("anyOf", [items1]) if isinstance(items1, dict) else [items1]
+        items2_list = items2.get("anyOf", [items2]) if isinstance(items2, dict) else [items2]
+        return {"type": "array", "items": {"anyOf": unique_anyOf(items1_list + items2_list)}}
+
+    return new_schema
 
 def discover_schema(value):
-    """
-    Determine the structure (type) of the JSON key's value.
-
-    Args:
-        value: The value of the JSON key. It can be of any type.
-    Returns:
-        dict: An object representing the structure of the JSON key's value.
-    """
+    """Infer schema for a JSON value."""
     if value is None:
         return {"type": "null"}
-    elif isinstance(value, str):
+    if isinstance(value, str):
         return {"type": "string"}
-    elif isinstance(value, float):
-        return {"type": "number"}
-    elif isinstance(value, int):
-        return {"type": "integer"}
-    elif isinstance(value, bool):
+    if isinstance(value, bool):
         return {"type": "boolean"}
-    elif isinstance(value, list):
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, list):
+        if not value:
+            return {"type": "array", "items": {}}
         item_schemas = [discover_schema(item) for item in value]
-        if item_schemas:
-            merged_items = reduce(merge_schemas, item_schemas)
-        else:
-            merged_items = {}
-        return {"type": "array", "items": merged_items}
-    elif isinstance(value, dict):
-        schema = {"type": "object", "required": list(set(value.keys())), "properties": {}}
-        for k, v in value.items():
-            schema["properties"][k] = discover_schema(v)
-        return schema
-    else:
-        raise TypeError(f"Unsupported value type: {type(value)}")
+        return {"type": "array", "items": {"anyOf": unique_anyOf(item_schemas)}}
+    if isinstance(value, dict):
+        properties = {k: discover_schema(v) for k, v in value.items()}
+        return {"type": "object", "properties": properties, "field_counts": {k: 1 for k in properties}, "total_count": 1}
+    raise TypeError(f"Unsupported type: {type(value)}")
 
-def build_schema_for_path(path, values):
+def set_additional_properties(keys, total_keys, threshold=0.9):
+
+    """Heuristic to allow/disallow additionalProperties."""
+    if total_keys <= 0:
+        return True
+    return not (len(keys) / total_keys >= threshold)
+
+def add_required_and_additional_properties(schema, path_freqs, prefix=("$",)):
     """
-    Build a partial schema for a given JSON path and its associated values.
-    Example path: ('$', 'build', 'gpu')
+    Recursively adds `required` and `additionalProperties` to object schemas
+    using path frequency counts.
 
     Args:
-        path (tuple): The JSON path as a tuple of keys.
-        values (list): List of JSON string values associated with the path.
+        schema (dict): Current JSON schema to update.
+        path_freqs (Counter): Maps full paths to counts across all objects.
+        prefix (tuple): Current path prefix.
     Returns:
-        dict: Partial JSON schema for the given path.
+        dict: Updated schema.
     """
-    # Infer schema for the values (structure only)
-    value_schemas = [discover_schema(json.loads(v)) for v in values]
-    value_schema = reduce(merge_schemas, value_schemas)
+    if not isinstance(schema, dict):
+        return schema
 
-    # Build hierarchical wrapper for the path
-    schema = deepcopy(value_schema)
-    for key in reversed(path[1:]):  # skip '$' root
-        schema = {
-            "type": "object",
-            "properties": {key: schema},
-            "required": [key],
+    if schema.get("type") == "object" and "properties" in schema:
+        # Count how many objects at this path contain each key
+        key_counts = {
+            key: path_freqs.get(prefix + (key,), 0)
+            for key in schema["properties"]
         }
+
+        # Total number of documents (objects) at this path
+        total_objects_here = max(key_counts.values(), default=0)
+
+        # Determine required keys (appear in all objects at this path)
+        required_keys = [k for k, count in key_counts.items() if count == total_objects_here]
+        if required_keys:
+            schema["required"] = required_keys
+
+        # Determine additionalProperties: False if no extra keys exist
+        observed_keys = {p[-1] for p in path_freqs if p[:-1] == prefix}
+        schema["additionalProperties"] = not all(k in schema["properties"] for k in observed_keys)
+
+        # Recurse into properties
+        for key, val in schema["properties"].items():
+            schema["properties"][key] = add_required_and_additional_properties(val, path_freqs, prefix + (key,))
+
+    # Arrays: recurse into items using '*'
+    elif schema.get("type") == "array" and "items" in schema:
+        schema["items"] = add_required_and_additional_properties(schema["items"], path_freqs, prefix + ("*",))
+
+    # anyOf / oneOf
+    for key in ("anyOf", "oneOf"):
+        if key in schema and isinstance(schema[key], list):
+            schema[key] = [add_required_and_additional_properties(s, path_freqs, prefix) for s in schema[key]]
 
     return schema
 
-def discover_schema_from_paths(paths_dict):
-    """
-    Infer a Baazizi-style JSON schema from (path, values) pairs.
-    This preserves full hierarchical structure.
-    """
-    all_schemas = []
 
-    for path, values in paths_dict.items():
-        if not values:
-            continue
-        sub_schema = build_schema_for_path(path, values)
-        all_schemas.append(sub_schema)
 
-    # Merge all partial schemas into one
+def canonicalize_schema(schema):
+    """Canonicalize schema for deduplication."""
+    if isinstance(schema, dict):
+        return {k: canonicalize_schema(schema[k]) for k in sorted(schema.keys())}
+    if isinstance(schema, list):
+        try:
+            return sorted((canonicalize_schema(x) for x in schema), key=lambda x: json.dumps(x, sort_keys=True))
+        except Exception:
+            return [canonicalize_schema(x) for x in schema]
+    return schema
+
+def dedupe_schema(schema, seen=None):
+    """Deduplicate repeated sub-schemas."""
+    if seen is None:
+        seen = {}
+    if isinstance(schema, dict):
+        key = json.dumps(canonicalize_schema(schema), sort_keys=True)
+        if key in seen:
+            return seen[key]
+        copy_schema = {}
+        seen[key] = copy_schema
+        for k, v in schema.items():
+            copy_schema[k] = dedupe_schema(v, seen)
+        return copy_schema
+    if isinstance(schema, list):
+        return [dedupe_schema(item, seen) for item in schema]
+    return schema
+
+def normalize_star(schema):
+    """Convert properties with '*' into arrays recursively."""
+    if not isinstance(schema, dict):
+        return schema
+    if schema.get("type") == "object" and "properties" in schema and "*" in schema["properties"]:
+        item_schema = normalize_star(schema["properties"]["*"])
+        return {"type": "array", "items": item_schema}
+    for k, v in list(schema.items()):
+        if isinstance(v, dict):
+            schema[k] = normalize_star(v)
+        elif isinstance(v, list):
+            schema[k] = [normalize_star(x) for x in v]
+    return schema
+
+def remove_temporary_fields(schema):
+    if isinstance(schema, dict):
+        schema.pop("field_counts", None)
+        schema.pop("total_count", None)
+        for v in schema.values():
+            remove_temporary_fields(v)
+    elif isinstance(schema, list):
+        for item in schema:
+            remove_temporary_fields(item)
+    return schema
+
+def finalize_schema(schema):
+    """Finalize schema: normalize '*', deduplicate anyOf/oneOf, remove temp fields."""
+    schema = normalize_star(schema)
+    schema = remove_temporary_fields(schema)
+
+    for key in ("anyOf", "oneOf"):
+        if isinstance(schema, dict) and key in schema:
+            merged = []
+            for s in schema[key]:
+                s = finalize_schema(s)
+                if s not in merged:
+                    merged.append(s)
+            schema[key] = merged[0] if len(merged) == 1 else merged
+
+    return dedupe_schema(schema)
+
+def build_schema_for_path(path, values):
+    """Build a partial schema for a given path and list of JSON string values."""
+    value_schemas = [discover_schema(json.loads(v)) for v in values]
+    value_schema = reduce(merge_schemas, value_schemas)
+    schema = deepcopy(value_schema)
+    for key in reversed(path[1:]):
+        schema = {"type": "object", "properties": {key: schema}}
+    return schema
+
+def discover_schema_from_paths(paths_dict, path_freqs, num_docs):
+    """Infer full schema from paths/values and add required/additionalProperties."""
+    all_schemas = [build_schema_for_path(p, v) for p, v in paths_dict.items() if v]
     if not all_schemas:
         return {"type": "null"}
-
     full_schema = reduce(merge_schemas, all_schemas)
-    return full_schema
+    full_schema = add_required_and_additional_properties(full_schema, path_freqs)
+    return finalize_schema(full_schema)
 
-def normalize_dynamic_paths(dynamic_paths):
-    """
-    Normalize string to tuples like ('$', 'build', 'gpu').
-    
-    Args:
-        dynamic_paths (list): List of dynamic paths as strings or tuples.
-    Returns:
-        list: Normalized and sorted list of dynamic paths as tuples.
-    """
-    normalized = []
-    for p in dynamic_paths:
-        if isinstance(p, tuple):
-            normalized.append(p)
-        elif isinstance(p, str):
-            try:
-                parsed = ast.literal_eval(p)
-                if isinstance(parsed, tuple):
-                    normalized.append(parsed)
-                else:
-                    raise ValueError(f"Invalid path format: {p}")
-            except Exception:
-                raise ValueError(f"Could not parse dynamic path: {p}")
-        else:
-            raise TypeError(f"Unsupported dynamic path type: {type(p)}")
-    return sorted(normalized, key=len, reverse=True)
 
-def transform_schema_with_dynamic_keys(schema, dynamic_paths):
-    """
-    Transform a Baazizi-style inferred schema by removing dynamic keys (bottom-up)
-    and replacing them with 'additionalProperties' that contains a 'oneOf' of
-    possible value structures.
+def save_schema(schema, path):
+    """Save JSON schema to file."""
+    with open(path, "w") as f:
+        json.dump(schema, f, indent=2)
 
-    Args:
-        schema (dict): Inferred schema (Baazizi-style).
-        dynamic_paths (list): List of tuple-like paths (e.g. "('$', 'build', 'gpu')").
 
-    Returns:
-        dict: Transformed schema.
-    """
-    transformed = deepcopy(schema)
+def process_single_dataset(file, inferred_schemas):
+    """Process a single dataset end-to-end."""
+    if not file.endswith("_results.csv"):
+        return f"Skipping {file} (not a results CSV)", None
 
-    # Normalize paths: parse string representations like "('$', 'build')" into tuples
-    parsed_paths = normalize_dynamic_paths(dynamic_paths)
+    dataset = file.replace("_results.csv", ".json")
+    inferred_schema_path = os.path.join(inferred_schemas, dataset)
+    if os.path.exists(inferred_schema_path):
+        return f"Skipping {dataset} — already processed.", None
 
-    for path in parsed_paths:
-        keys = path[1:]  # skip '$'
-
-        # Case 1: Root dynamic ('$') — replace all properties with oneOf
-        if len(keys) == 0:
-            if "properties" in transformed:
-                candidates = list(transformed["properties"].values())
-                transformed.pop("properties", None)
-                transformed["additionalProperties"] = {"oneOf": candidates}
-            continue
-
-        # Case 2: Nested dynamic path
-        parent = transformed
-        for i, key in enumerate(keys):
-            if "properties" in parent and key in parent["properties"]:
-                # Reached the dynamic key
-                if i == len(keys) - 1:
-                    key_schema = parent["properties"][key]
-                    del parent["properties"][key]
-
-                    if "additionalProperties" not in parent:
-                        parent["additionalProperties"] = {"oneOf": []}
-
-                    ap = parent["additionalProperties"]
-                    if "oneOf" not in ap:
-                        ap["oneOf"] = []
-
-                    # Avoid duplicates
-                    serialized = json.dumps(key_schema, sort_keys=True)
-                    if not any(json.dumps(s, sort_keys=True) == serialized for s in ap["oneOf"]):
-                        ap["oneOf"].append(key_schema)
-
-                else:
-                    parent = parent["properties"][key]
-            elif parent.get("type") == "array" and "items" in parent:
-                parent = parent["items"]
-            else:
-                break
-
-    return transformed
-
-def get_schema_size(schema):
-    """
-    Get the size of a JSON schema in bytes without whitespace.
-
-    Args:
-        schema (dict): JSON schema.
-
-    Returns:
-        int: Size of the schema in bytes.
-    """
-    schema_str = json.dumps(schema, separators=(",", ":"))
-    return len(schema_str.encode("utf-8")) 
-
-def compare_schema_sizes(schema1, schema2):
-    """
-    Compare two JSON schemas for size (bytes).
-
-    Args:
-        schema1 (dict): First JSON schema.
-        schema2 (dict): Second JSON schema.
-    Returns:
-        tuple: (size1, size2, size_difference)
-    """
-    size1 = get_schema_size(schema1)
-    size2 = get_schema_size(schema2)
-    return size1, size2, size1 - size2
+    try:
+        paths_dict, path_freqs, num_docs, _ = process_dataset(dataset)
+        inferred_schema = discover_schema_from_paths(paths_dict, path_freqs, num_docs)
+        save_schema(inferred_schema, inferred_schema_path)
+        return f"Processed {dataset}", True
+    except Exception as e:
+        return f"Error processing {file}: {e}", False
 
 
 def main():
-    #parser = argparse.ArgumentParser()
-    #parser.add_argument("--input", type=str, help="Directory with input JSON files")
-    #parser.add_argument("--output", type=str, help="Directory for ground truth CSVs")
-    #args = parser.parse_args()
+    start_time = time.time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("eval_input", type=str, help="Directory for ground truth CSVs")
+    parser.add_argument("inferred_schemas", type=str, help="Directory for inferred schemas")
+    args = parser.parse_args()
 
-    #json_dir = args.input
-    groundtruth_dir = "evaluation_results"
-    inferred_schemas = "inferred_schemas"
-    transformed_schemas = "transformed_schemas"
+    os.makedirs(args.inferred_schemas, exist_ok=True)
+    files = [f for f in os.listdir(args.eval_input) if f.endswith("_results.csv")]
 
-    # Create output directories if they don't exist
-    os.makedirs(inferred_schemas, exist_ok=True)
-    os.makedirs(transformed_schemas, exist_ok=True)
+    results = []
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = {executor.submit(process_single_dataset, f, args.inferred_schemas): f for f in files}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Inferring schemas"):
+            try:
+                msg, success = future.result()
+            except Exception as e:
+                msg, success = f"Worker exception: {e}", False
+            print(msg, flush=True)
+            results.append((msg, success))
 
-    for file in os.listdir(groundtruth_dir): 
-        paths_dict, _, dataset = process_dataset(file)
-        dataset = dataset.replace(".json", "_results.csv")
-        dataset_path = os.path.join(groundtruth_dir, dataset)
-        groundtruth = pd.read_csv(dataset_path, sep=";")
-        file = file.replace("_results.csv", ".json")
+    end_time = time.time()
+    total_success = sum(1 for _, s in results if s)
+    total_errors = sum(1 for _, s in results if s is False)
+    total_skipped = sum(1 for _, s in results if s is None)
 
-        # Initialize schema from all paths
-        schema = discover_schema_from_paths(paths_dict)
-        print(f"Initial schema for {file} inferred.", flush=True)
+    print("\n--- SUMMARY ---")
+    print(f"Processed: {total_success}")
+    print(f"Skipped:   {total_skipped}")
+    print(f"Errors:    {total_errors}")
+    print(f"Total time: {end_time - start_time:.2f} sec", flush=True)
 
-        # Extract dynamic paths and sort bottom-up
-        dynamic_paths = groundtruth[(groundtruth["label"] == 1) & (groundtruth["correct"] == True)]["path"].tolist()
-        dynamic_paths = sorted(dynamic_paths, key=len, reverse=True)
-        print(f"Dynamic paths for {file} extracted.", flush=True)
 
-        # Transform schema
-        transformed_schema = transform_schema_with_dynamic_keys(schema, dynamic_paths)
-        print(f"Transformed schema for {file} created.", flush=True)
-
-        # Compare schema sizes
-        schema_size, transformed_size, size_diff = compare_schema_sizes(schema, transformed_schema)
-        print(f"Dataset: {file}, Original Schema Size: {schema_size} bytes, Transformed Schema Size: {transformed_size} bytes, Size Difference: {size_diff} bytes", flush=True)
-        
-        # Store schemas
-        inferred_schema_path = os.path.join(inferred_schemas, file)
-        transformed_schema_path = os.path.join(transformed_schemas, file)
-
-        with open(inferred_schema_path, "w") as f:
-            json.dump(schema, f, indent=2)
-
-        with open(transformed_schema_path, "w") as f:
-            json.dump(transformed_schema, f, indent=2)
-
-        
 if __name__ == "__main__":
     main()
