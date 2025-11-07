@@ -16,20 +16,19 @@ ARRAY_WILDCARD = "<ARRAY_ITEM>"
 # Document Parsing
 # -------------------------------
 def parse_document(doc, path=("$",)):
+    """Yield (path, value) for all nodes in the JSON document."""
+    yield path, doc  # Always emit the current node
+
     if isinstance(doc, dict):
-        yield path, doc
         for k, v in doc.items():
             current_path = path + (k,)
-            yield current_path, v
-            if isinstance(v, (dict, list)):
-                yield from parse_document(v, current_path)
+            yield from parse_document(v, current_path)
+
     elif isinstance(doc, list):
-        yield path, doc
         for item in doc:
             current_path = path + (ARRAY_WILDCARD,)
-            yield current_path, item
-            if isinstance(item, (dict, list)):
-                yield from parse_document(item, current_path)
+            yield from parse_document(item, current_path)
+
 
 def process_document(doc, paths_dict, path_freqs):
     for path, value in parse_document(doc):
@@ -257,6 +256,27 @@ def compact_anyof(schema):
 # -------------------------------
 # Add required and additionalProperties
 # -------------------------------
+def infer_type(values):
+    """Infer a generalized type from a list of JSON values."""
+    types = set()
+    for v in values:
+        if v is None:
+            types.add("null")
+        elif isinstance(v, bool):
+            types.add("boolean")
+        elif isinstance(v, (int, float)):
+            types.add("number")
+        elif isinstance(v, str):
+            types.add("string")
+        elif isinstance(v, list):
+            types.add("array")
+        elif isinstance(v, dict):
+            types.add("object")
+        else:
+            types.add("string")
+
+    return types
+
 def add_required_and_additional(schema, paths_dict, path_freqs, path=("$",)):
     """
     Recursively add 'required' and infer 'additionalProperties' based on observed data.
@@ -295,23 +315,7 @@ def add_required_and_additional(schema, paths_dict, path_freqs, path=("$",)):
                             extra_values.append(value)
 
         if extra_values:
-            # Abstract types of extra keys
-            extra_types = set()
-            for v in extra_values:
-                if v is None:
-                    extra_types.add("null")
-                elif isinstance(v, bool):
-                    extra_types.add("boolean")
-                elif isinstance(v, (int, float)):
-                    extra_types.add("number")
-                elif isinstance(v, str):
-                    extra_types.add("string")
-                elif isinstance(v, list):
-                    extra_types.add("array")
-                elif isinstance(v, dict):
-                    extra_types.add("object")
-                else:
-                    extra_types.add("string")
+            extra_types = infer_type(extra_values)
 
             if len(extra_types) == 1:
                 schema["additionalProperties"] = {"type": extra_types.pop()}
