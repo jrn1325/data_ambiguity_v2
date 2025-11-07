@@ -24,6 +24,7 @@ DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 JSON_FOLDER = "processed_jsons"
 SCHEMA_FOLDER = "converted_processed_schemas"
 MODEL_NAME = "microsoft/codebert-base"
+ARRAY_WILDCARD = "<ARRAY_ITEM>"
 
 # Load CodeBERT
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -251,7 +252,7 @@ def extract_paths(doc, path=("$",)):
 
     elif isinstance(doc, list):
         for index, item in enumerate(doc):
-            current_path = path + ("*",)
+            current_path = path + (ARRAY_WILDCARD,)
             yield current_path, item
             if isinstance(item, (dict, list)):
                 yield from extract_paths(item, current_path)
@@ -263,11 +264,16 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
     """
     Extracts paths from the given JSON document and stores them in dictionaries,
     grouping paths that share the same prefix and capturing the frequency and data type of nested keys.
+
+    Args:
+        doc (dict): The JSON document to process.
+        path_types_dict (defaultdict): A dictionary to store path types and frequencies.
+        parent_frequency_dict (defaultdict): A dictionary to store parent path frequencies.
     """
     for path, value in extract_paths(doc):
         if len(path) > 1:
             nested_key = path[-1]
-            if nested_key == "*":
+            if nested_key == ARRAY_WILDCARD:
                 continue
 
             prefix = path[:-1]
@@ -307,7 +313,6 @@ def calc_semantic_similarity(nested_keys):
 
     Args:
         nested_keys (dict): A dictionary where keys are nested keys and values are their types.
-
     Returns:
         float: The average cosine similarity between the embeddings of the nested keys.
         
@@ -325,6 +330,16 @@ def calc_semantic_similarity(nested_keys):
     return round(avg_similarity, 3)
 
 def create_dataframe(path_types_dict, parent_frequency_dict, dataset):
+    """
+    Create a DataFrame from the path types and parent frequencies.
+
+    Args:
+        path_types_dict (defaultdict): A dictionary containing path types and frequencies.
+        parent_frequency_dict (defaultdict): A dictionary containing parent path frequencies.
+        dataset (str): The name of the dataset.
+    Returns:
+        pd.DataFrame: A DataFrame containing the processed data.
+    """
     data = []
 
     for path, nested_keys in path_types_dict.items():
@@ -382,7 +397,6 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset):
 
     df = pd.DataFrame(data)
     return df
-
 
 def compare_paths(json_path, static_path):
     """
