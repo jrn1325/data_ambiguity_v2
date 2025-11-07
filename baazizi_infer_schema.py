@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import hashlib
 import time
 from collections import defaultdict, Counter
 from copy import deepcopy
@@ -16,8 +15,16 @@ ARRAY_WILDCARD = "<ARRAY_ITEM>"
 # Document Parsing
 # -------------------------------
 def parse_document(doc, path=("$",)):
-    """Yield (path, value) for all nodes in the JSON document."""
-    yield path, doc  # Always emit the current node
+    """
+    Parse a JSON document.
+    
+    Args:
+        doc: JSON document
+        path: tuple representing the location in the JSON structure
+    Yields:
+        (path, value) pairs..
+    """
+    yield path, doc
 
     if isinstance(doc, dict):
         for k, v in doc.items():
@@ -29,8 +36,15 @@ def parse_document(doc, path=("$",)):
             current_path = path + (ARRAY_WILDCARD,)
             yield from parse_document(item, current_path)
 
-
 def process_document(doc, paths_dict, path_freqs):
+    """
+    Process a single JSON document.
+
+    Args:
+        doc: JSON document
+        paths_dict: dict mapping path tuples to list of JSON values
+        path_freqs: Counter for path frequencies
+    """ 
     for path, value in parse_document(doc):
         path_freqs[path] += 1
         try:
@@ -69,7 +83,14 @@ def process_dataset(dataset):
 # Discover schema
 # -------------------------------
 def discover_schema(value):
-    """Infer JSON schema for any JSON value."""
+    """
+    Discover JSON schema for a given JSON value.
+
+    Args:
+        value: JSON value
+    Returns:
+        dict: JSON schema
+    """
     if value is None:
         return {"type": "null"}
     elif isinstance(value, bool):
@@ -91,7 +112,14 @@ def discover_schema(value):
         raise TypeError(f"Unsupported type: {type(value)}")
 
 def remove_duplicate_schemas(schemas):
-    """Remove duplicate schemas from a list, preserving order."""
+    """
+    Remove duplicate schemas from a list.
+
+    Args:
+        schemas: list of JSON schemas
+    Returns:
+        list of unique JSON schemas
+    """
     unique = []
     for schema in schemas:
         if schema not in unique:
@@ -99,7 +127,15 @@ def remove_duplicate_schemas(schemas):
     return unique
 
 def merge_schemas(schema1, schema2):
-    """Merge two JSON schemas into one safely without nested helper functions."""
+    """
+    Merge two JSON schemas into a unified schema.
+
+    Args:
+        schema1: first JSON schema
+        schema2: second JSON schema
+    Returns:
+        dict: merged JSON schema
+    """
     # Avoid modifying the original input
     schema1 = deepcopy(schema1)
     schema2 = deepcopy(schema2)
@@ -152,7 +188,6 @@ def merge_schemas(schema1, schema2):
         schema1["items"] = merge_schemas(items1, items2)
         return schema1
 
-    # Primitives of same type are compatible
     return schema1
 
 def discover_schema_from_paths(paths_dict):
@@ -257,7 +292,14 @@ def compact_anyof(schema):
 # Add required and additionalProperties
 # -------------------------------
 def infer_type(values):
-    """Infer a generalized type from a list of JSON values."""
+    """
+    Infer a type from a list of JSON values.
+    
+    Args:
+        values: list of JSON values
+    Returns:
+        set of inferred types
+    """
     types = set()
     for v in values:
         if v is None:
@@ -279,12 +321,18 @@ def infer_type(values):
 
 def add_required_and_additional(schema, paths_dict, path_freqs, path=("$",)):
     """
-    Recursively add 'required' and infer 'additionalProperties' based on observed data.
-
+    Add 'required' and infer 'additionalProperties' based on observed data.
     - A field is 'required' if it appears in all objects at its parent path.
-    - additionalProperties is False if no extra keys exist, else a generalized schema
+    - additionalProperties is False if no extra keys exist, else a schema
       covering the types of extra keys observed.
-    - Empty objects are allowed implicitly (no additionalProperties added).
+
+    Args:
+        schema: JSON schema
+        paths_dict: dict mapping path tuples to list of JSON values
+        path_freqs: Counter for path frequencies
+        path: current path in the schema
+    Returns:
+        dict: updated JSON schema
     """
     schema_type = schema.get("type")
 
@@ -343,74 +391,117 @@ def add_required_and_additional(schema, paths_dict, path_freqs, path=("$",)):
     return schema
 
 
-
-
 # -------------------------------
 # Add $defs for repeated schemas
 # -------------------------------
 def serialize_schema(schema):
-    """Convert schema dict to a canonical string for hashing."""
+    """
+    Convert schema dict to a canonical string for hashing.
+
+    Args:
+        schema: JSON schema
+    Returns:
+        str: serialized schema
+    """
     return json.dumps(schema, sort_keys=True)
 
-def replace_with_ref(schema, definitions, seen):
+def replace_with_ref(schema, definitions, seen, min_size=2):
     """
     Replace repeated object/array schemas with $ref to definitions.
-    
-    Returns the transformed schema.
+    Only replaces if a schema structure repeats at least `min_size` times.
+
+    Args:
+        schema: JSON schema
+        definitions: dict to store definitions
+        seen: dict counting seen schema structures
+        min_size: minimum occurrences to create a definition
+    Returns:
+        dict: updated JSON schema with $ref replacements
     """
+    if not isinstance(schema, dict):
+        return schema
+
     schema_type = schema.get("type")
 
-    # Only consider objects, arrays, or anyOf for definitions
+    # Recurse into children first
+    if schema_type == "object":
+        props = schema.get("properties", {})
+        new_props = {}
+        for k, v in props.items():
+            new_props[k] = replace_with_ref(v, definitions, seen, min_size)
+        schema["properties"] = new_props
+
+    elif schema_type == "array":
+        items = schema.get("items")
+        if isinstance(items, dict):
+            schema["items"] = replace_with_ref(items, definitions, seen, min_size)
+
+    elif "anyOf" in schema:
+        schema["anyOf"] = [replace_with_ref(sub, definitions, seen, min_size) for sub in schema["anyOf"]]
+
+    # Only consider non-trivial objects/arrays for definitions
     if schema_type in ("object", "array") or "anyOf" in schema:
         key = serialize_schema(schema)
-        if key in seen:
-            return {"$ref": f"#/$defs/{seen[key]}"}
-        else:
-            def_name = f"{len(seen) + 1}"
-            seen[key] = def_name
+        seen[key] += 1
 
-            schema_copy = deepcopy(schema)
-
-            # Recurse into children explicitly
-            if schema_type == "object":
-                props = schema_copy.get("properties", {})
-                new_props = {}
-                for k, v in props.items():
-                    new_props[k] = replace_with_ref(v, definitions, seen)
-                schema_copy["properties"] = new_props
-            elif schema_type == "array":
-                items = schema_copy.get("items")
-                if isinstance(items, dict):
-                    schema_copy["items"] = replace_with_ref(items, definitions, seen)
-            elif "anyOf" in schema_copy:
-                schema_copy["anyOf"] = [replace_with_ref(sub, definitions, seen) for sub in schema_copy["anyOf"]]
-
-            definitions[def_name] = schema_copy
+        # If we've seen it enough times, assign a $ref
+        if seen[key] == min_size:
+            def_name = f"{len(definitions) + 1}"
+            definitions[def_name] = deepcopy(schema)
             return {"$ref": f"#/$defs/{def_name}"}
-    return schema  # primitives remain unchanged
+        elif seen[key] > min_size:
+            # Already defined
+            for name, s in definitions.items():
+                if serialize_schema(s) == key:
+                    return {"$ref": f"#/$defs/{name}"}
 
-def generate_definitions(schema):
+    return schema  
+
+def generate_definitions(schema, min_size=2):
     """
     Generate $defs for repeated schemas.
-    
-    Returns a new schema with a top-level $defs section.
+    Only creates a definition if it appears at least `min_size` times.
+
+    Args:
+        schema: JSON schema
+        min_size: minimum occurrences to create a definition
+    Returns:
+        dict: updated JSON schema with $defs
     """
     definitions = {}
-    seen = {}
-    new_schema = replace_with_ref(deepcopy(schema), definitions, seen)
-    return {"$defs": definitions, **new_schema}
+    seen = defaultdict(int)
+    new_schema = replace_with_ref(deepcopy(schema), definitions, seen, min_size=min_size)
+
+    if definitions:
+        new_schema["$defs"] = definitions
+    return new_schema
 
 
 
-
+# -------------------------------
+# Processing and Saving Schemas
+# -------------------------------
 def save_schema(schema, path):
-    """Save JSON schema to file."""
+    """
+    Save JSON schema to file.
+
+    Args:
+        schema: JSON schema
+        path: file path to save the schema
+    """
     with open(path, "w") as f:
         json.dump(schema, f, indent=2)
 
-
 def process_single_dataset(file, inferred_schemas):
-    """Process a single dataset end-to-end."""
+    """
+    Process a single dataset to infer its JSON schema.
+    
+    Args:
+        file: filename of the results CSV
+        inferred_schemas: directory to save inferred schemas
+    Returns:
+        tuple: (message, success flag)
+    """
     if not file.endswith("_results.csv"):
         return f"Skipping {file} (not a results CSV)", None
 
@@ -425,7 +516,7 @@ def process_single_dataset(file, inferred_schemas):
         inferred_schema = discover_schema_from_paths(paths_dict)
         compacted_schema = compact_anyof(inferred_schema)
         schema = add_required_and_additional(compacted_schema, paths_dict=paths_dict, path_freqs=path_freqs, path=("$",))
-        #schema = generate_definitions(schema)
+        schema = generate_definitions(schema)
         save_schema(schema, inferred_schema_path)
         return f"Processed {dataset}", True
     except Exception as e:
