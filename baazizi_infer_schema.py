@@ -61,7 +61,7 @@ def process_dataset(dataset):
     dataset_file = os.path.join(JSON_FOLDER, dataset.replace("_results.csv", ".json"))
     if not os.path.exists(dataset_file):
         print(f"Dataset not found: {dataset_file}")
-        return paths_dict, path_freqs, 0, dataset
+        return paths_dict, path_freqs, 0
 
     with open(dataset_file, "r") as f:
         for line in f:
@@ -76,7 +76,7 @@ def process_dataset(dataset):
                 process_document(item, paths_dict, path_freqs)
                 num_docs += 1
 
-    return paths_dict, path_freqs, num_docs, dataset
+    return paths_dict, path_freqs, num_docs
 
 
 # -------------------------------
@@ -319,76 +319,101 @@ def infer_type(values):
 
     return types
 
-def add_required_and_additional(schema, paths_dict, path_freqs, path=("$",)):
-    """
-    Add 'required' and infer 'additionalProperties' based on observed data.
-    - A field is 'required' if it appears in all objects at its parent path.
-    - additionalProperties is False if no extra keys exist, else a schema
-      covering the types of extra keys observed.
 
-    Args:
-        schema: JSON schema
-        paths_dict: dict mapping path tuples to list of JSON values
-        path_freqs: Counter for path frequencies
-        path: current path in the schema
-    Returns:
-        dict: updated JSON schema
+def add_required_and_additional(schema, paths_dict, path_freqs, num_docs, path=("$",)):
     """
+    Enhance schema with:
+    - 'required' fields (appear in all instances of parent)
+    - 'additionalProperties' for optional or unknown fields
+    
+    Rules:
+    - A key is 'required' if its path frequency == parent path frequency
+      (or == num_docs at root level)
+    - Non-required or unknown keys are merged into additionalProperties
+    - If all have same type, just use {"type": t}, else use {"anyOf": ...}
+    - If no optional/unknown keys exist, set additionalProperties=False
+    - If object always empty, omit both 'properties' and 'additionalProperties'
+    """
+
     schema_type = schema.get("type")
 
     if schema_type == "object":
         props = schema.get("properties", {})
         required = []
 
+        # Determine frequency for this object
+        parent_freq = path_freqs.get(path, num_docs if path == ("$",) else 0)
+
         # Determine required fields
-        parent_freq = path_freqs.get(path, 0)
-        for key in props.keys():
+        for key in list(props.keys()):
             child_path = path + (key,)
             if path_freqs.get(child_path, 0) == parent_freq:
                 required.append(key)
+
         if required:
             schema["required"] = sorted(required)
 
-        # Determine additionalProperties
+        # Gather possible extra key values
         extra_values = []
         empty_object_seen = False
+
         for serialized_obj in paths_dict.get(path, []):
-            obj = json.loads(serialized_obj)
+            try:
+                obj = json.loads(serialized_obj)
+            except Exception:
+                continue
+
             if isinstance(obj, dict):
                 if not obj:
                     empty_object_seen = True
                 else:
                     for key, value in obj.items():
-                        if key not in props:
+                        # key not required -> belongs in additionalProperties
+                        if key not in required:
                             extra_values.append(value)
 
+        # Infer type(s) for additional properties
         if extra_values:
             extra_types = infer_type(extra_values)
 
             if len(extra_types) == 1:
-                schema["additionalProperties"] = {"type": extra_types.pop()}
+                schema["additionalProperties"] = {"type": next(iter(extra_types))}
             else:
-                schema["additionalProperties"] = {"anyOf": [{"type": t} for t in sorted(extra_types)]}
+                schema["additionalProperties"] = {
+                    "anyOf": [{"type": t} for t in sorted(extra_types)]
+                }
+
+            # Remove non-required keys from properties to avoid redundancy
+            for key in list(props.keys()):
+                if key not in required:
+                    props.pop(key, None)
 
         elif not empty_object_seen:
+            # No extra keys, and not always empty object
             schema["additionalProperties"] = False
+
+        # Remove empty properties dict for always-empty objects
+        if not props and not extra_values:
+            schema.pop("properties", None)
+            schema.pop("additionalProperties", None)
 
         # Recurse into properties
         for key, subschema in props.items():
-            add_required_and_additional(subschema, paths_dict, path_freqs, path + (key,))
+            add_required_and_additional(subschema, paths_dict, path_freqs, num_docs, path + (key,))
 
     elif schema_type == "array":
         items = schema.get("items")
         if isinstance(items, dict):
-            add_required_and_additional(items, paths_dict, path_freqs, path + (ARRAY_WILDCARD,))
+            add_required_and_additional(items, paths_dict, path_freqs, num_docs, path + (ARRAY_WILDCARD,))
 
     elif "anyOf" in schema:
         anyof_value = schema["anyOf"]
         if isinstance(anyof_value, list):
             for subschema in anyof_value:
-                add_required_and_additional(subschema, paths_dict, path_freqs, path)
+                add_required_and_additional(subschema, paths_dict, path_freqs, num_docs, path)
 
     return schema
+
 
 
 # -------------------------------
@@ -512,10 +537,10 @@ def process_single_dataset(file, inferred_schemas):
 
     try:
         print(f"Processing dataset: {dataset}", flush=True)
-        paths_dict, path_freqs, _, _ = process_dataset(dataset)
+        paths_dict, path_freqs, num_docs = process_dataset(dataset)
         inferred_schema = discover_schema_from_paths(paths_dict)
         compacted_schema = compact_anyof(inferred_schema)
-        schema = add_required_and_additional(compacted_schema, paths_dict=paths_dict, path_freqs=path_freqs, path=("$",))
+        schema = add_required_and_additional(compacted_schema, paths_dict=paths_dict, path_freqs=path_freqs, num_docs=num_docs, path=("$",))
         schema = generate_definitions(schema)
         save_schema(schema, inferred_schema_path)
         return f"Processed {dataset}", True
