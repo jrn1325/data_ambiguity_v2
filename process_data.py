@@ -451,6 +451,24 @@ def label_paths(df, static_paths):
     
     return df
 
+def save_valid_docs(matched_jsons_dir, dataset_path, valid_docs):
+    """
+    Save valid documents to a JSON file.
+
+    Args:
+        matched_jsons_dir (str): The directory to save the matched JSON files.
+        dataset_path (str): The path to the dataset file.
+        valid_docs (list): List of valid JSON documents to save.
+    """
+    
+    output_path = os.path.join(matched_jsons_dir, os.path.basename(dataset_path))
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with open(output_path, 'w') as outfile:
+        for doc in valid_docs:
+            json.dump(doc, outfile)
+            outfile.write('\n')
+
 def process_dataset(dataset):
     """
     Process and extract data from the documents, and return a DataFrame.
@@ -459,14 +477,13 @@ def process_dataset(dataset):
         dataset (str): The name of the dataset file.
     
     Returns:
-        pd.DataFrame or None: A DataFrame for the dataset, or None if no data is processed.
+        tuple: (pd.DataFrame or None, list of valid JSON documents)
     """
 
     path_types_dict = defaultdict(lambda: defaultdict(lambda: {"frequency": 0, "type": set()}))
     parent_frequency_dict = defaultdict(int)
     
-    num_docs = 0  
-    matched_document_count = 0 
+    valid_docs = []
 
     # Load the schema
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
@@ -477,40 +494,39 @@ def process_dataset(dataset):
 
     # Load and process the dataset
     dataset_path = os.path.join(JSON_FOLDER, dataset)
-    with open(dataset_path, 'r') as file:
+    with open(dataset_path, 'r', encoding='utf-8') as file:
         for line in file:
-            doc = json.loads(line)
             try: 
+                doc = json.loads(line)
                 if isinstance(doc, dict) and match_properties(schema, doc):
-                    matched_document_count += 1 
                     process_document(doc, path_types_dict, parent_frequency_dict)
-                    num_docs += 1
+                    valid_docs.append(doc)
                 elif isinstance(doc, list):
                     for item in doc:
                         if isinstance(item, dict) and match_properties(schema, item):
-                            matched_document_count += 1 
                             process_document(item, path_types_dict, parent_frequency_dict)
-                            num_docs += 1
+                            valid_docs.append(item)
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
 
     if len(path_types_dict) == 0:
         print(f"No paths of type object extracted from {dataset}.")
-        return None
-    
+        return None, valid_docs
+
     df = create_dataframe(path_types_dict, parent_frequency_dict, dataset)
     print(f"Dataset: {dataset}, Total Paths: {len(df)}, Static Paths: {len(static_paths)}", flush=True)
     df = label_paths(df, static_paths)
-        
-    return df
 
-def preprocess_data(schema_list):
+    return df, valid_docs
+
+def preprocess_data(schema_list, is_train=True):
     """
     Preprocess all dataset files in a folder, processing them sequentially.
 
     Args:
         schema_list (list): List of schema files to use for processing.
+        is_train (bool): Whether the datasets are for training or testing.
 
     Returns:
         pd.DataFrame: A merged DataFrame containing labeled data from all datasets.
@@ -524,14 +540,30 @@ def preprocess_data(schema_list):
     sys.stderr.write('Processing datasets sequentially...\n')
     
     for dataset in tqdm.tqdm(datasets, total=len(datasets)):
-        df = process_dataset(dataset)  
+        df, valid_docs = process_dataset(dataset)  
+
+        if is_train:
+            matched_jsons_dir = "train_jsons"
+        else:
+            matched_jsons_dir = "test_jsons"
+
+        # Save valid docs only if they exist
+        if valid_docs:
+            save_valid_docs(matched_jsons_dir, dataset, valid_docs)
+
+        # Only append non-empty DataFrames
         if df is not None:
             frames.append(df)
+
+    if not frames:
+        sys.stderr.write('No valid data found in any dataset.\n')
+        return pd.DataFrame()  # return empty DataFrame if nothing processed
 
     sys.stderr.write('Merging dataframes...\n')
     df = pd.concat(frames, ignore_index=True)
 
     return df
+
 
 def resample_data(df, random_value):
     """
@@ -583,13 +615,14 @@ def main():
     # Split the data into training and testing sets
     train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
 
+    is_train = len(train_set) > len(test_set)
     # Preprocess the training data
-    train_df = preprocess_data(train_set)
+    train_df = preprocess_data(train_set, is_train=is_train)
     #train_df = resample_data(train_df, random_value)
     train_df.to_csv("train_data.csv", index=False, sep=";")
     
     # Preprocess the testing data
-    test_df = preprocess_data(test_set)
+    test_df = preprocess_data(test_set, is_train=not is_train)
     test_df.to_csv("test_data.csv", index=False, sep=";")
 
     end_time = time.time()
