@@ -326,7 +326,8 @@ def calc_semantic_similarity(nested_keys):
     similarity_matrix = cosine_similarity(embeddings)
 
     # Exclude diagonal (self-similarity)
-    avg_similarity = (np.sum(similarity_matrix) - n_keys) / (n_keys * (n_keys - 1))
+    avg_similarity = float((np.sum(similarity_matrix) - n_keys) / (n_keys * (n_keys - 1)))
+
     return round(avg_similarity, 3)
 
 def create_dataframe(path_types_dict, parent_frequency_dict, dataset):
@@ -354,12 +355,17 @@ def create_dataframe(path_types_dict, parent_frequency_dict, dataset):
         for nested_key, nested_key_info in nested_keys.items():
             frequency = nested_key_info["frequency"] / parent_frequency if parent_frequency else 0
             value_type = nested_key_info["type"]
-            values_types.add(json.dumps(list(value_type)))
+
+            # Convert set to list if necessary
+            if isinstance(value_type, set):
+                value_type = list(value_type)
+
+            values_types.add(json.dumps(value_type))  # for datatype_entropy calculation
             frequencies.append(frequency)
 
             schema_info["properties"][nested_key] = {
-                "frequency": round(frequency, 3),
-                "type": value_type
+                "frequency": round(frequency, 2),
+                "type": value_type  # now always JSON-serializable
             }
 
             # Required if appears in every parent occurrence
