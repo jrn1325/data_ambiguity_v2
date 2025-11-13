@@ -610,7 +610,7 @@ def main():
         sys.exit(1)
 
     train_ratio = float(train_size)
-    random_value = int(random_value)
+    random_value = int(random_value) # 101
     
     # Split the data into training and testing sets
     train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
@@ -618,7 +618,7 @@ def main():
     is_train = len(train_set) > len(test_set)
     # Preprocess the training data
     train_df = preprocess_data(train_set, is_train=is_train)
-    #train_df = resample_data(train_df, random_value)
+    train_df = resample_data(train_df, random_value)
     train_df.to_csv("train_data.csv", index=False, sep=";")
     
     # Preprocess the testing data
