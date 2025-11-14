@@ -8,7 +8,6 @@ from functools import reduce
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-JSON_FOLDER = "processed_jsons"
 ARRAY_WILDCARD = "<ARRAY_ITEM>"
 
 # -------------------------------
@@ -53,17 +52,13 @@ def process_document(doc, paths_dict, path_freqs):
             serialized = str(value)
         paths_dict[path].append(serialized)
 
-def process_dataset(dataset):
+def process_dataset(test_json_dir, dataset):
     paths_dict = defaultdict(list)
     path_freqs = Counter()
     num_docs = 0
 
-    dataset_file = os.path.join(JSON_FOLDER, dataset.replace("_results.csv", ".json"))
-    if not os.path.exists(dataset_file):
-        print(f"Dataset not found: {dataset_file}")
-        return paths_dict, path_freqs, 0
-
-    with open(dataset_file, "r") as f:
+    dataset_path = os.path.join(test_json_dir, dataset)
+    with open(dataset_path, "r") as f:
         for line in f:
             try:
                 doc = json.loads(line)
@@ -319,7 +314,6 @@ def infer_type(values):
 
     return types
 
-
 def add_required_and_additional(schema, paths_dict, path_freqs, num_docs, path=("$",)):
     """
     Enhance schema with:
@@ -415,7 +409,6 @@ def add_required_and_additional(schema, paths_dict, path_freqs, num_docs, path=(
     return schema
 
 
-
 # -------------------------------
 # Add $defs for repeated schemas
 # -------------------------------
@@ -502,7 +495,6 @@ def generate_definitions(schema, min_size=2):
     return new_schema
 
 
-
 # -------------------------------
 # Processing and Saving Schemas
 # -------------------------------
@@ -517,33 +509,31 @@ def save_schema(schema, path):
     with open(path, "w") as f:
         json.dump(schema, f, indent=2)
 
-def process_single_dataset(file, inferred_schemas):
+def process_single_dataset(test_json_dir, file, inferred_schemas):
     """
     Process a single dataset to infer its JSON schema.
     
     Args:
-        file: filename of the results CSV
+        test_json_dir: directory containing test JSON files
+        file: filename of the test JSON
         inferred_schemas: directory to save inferred schemas
     Returns:
         tuple: (message, success flag)
     """
-    if not file.endswith("_results.csv"):
-        return f"Skipping {file} (not a results CSV)", None
 
-    dataset = file.replace("_results.csv", ".json")
-    inferred_schema_path = os.path.join(inferred_schemas, dataset)
+    inferred_schema_path = os.path.join(inferred_schemas, file)
     if os.path.exists(inferred_schema_path):
-        return f"Skipping {dataset} — already processed.", None
+        return f"Skipping {file} — already processed.", None
 
     try:
-        print(f"Processing dataset: {dataset}", flush=True)
-        paths_dict, path_freqs, num_docs = process_dataset(dataset)
+        print(f"Processing dataset: {file}", flush=True)
+        paths_dict, path_freqs, num_docs = process_dataset(test_json_dir, file)
         inferred_schema = discover_schema_from_paths(paths_dict)
         compacted_schema = compact_anyof(inferred_schema)
-        schema = add_required_and_additional(compacted_schema, paths_dict=paths_dict, path_freqs=path_freqs, num_docs=num_docs, path=("$",))
-        schema = generate_definitions(schema)
-        save_schema(schema, inferred_schema_path)
-        return f"Processed {dataset}", True
+        #schema = add_required_and_additional(compacted_schema, paths_dict=paths_dict, path_freqs=path_freqs, num_docs=num_docs, path=("$",))
+        #schema = generate_definitions(schema)
+        save_schema(compacted_schema, inferred_schema_path)
+        return f"Processed {file}", True
     except Exception as e:
         return f"Error processing {file}: {e}", False
 
@@ -553,16 +543,16 @@ def process_single_dataset(file, inferred_schemas):
 def main():
     start_time = time.time()
     parser = argparse.ArgumentParser()
-    parser.add_argument("eval_input", type=str, help="Directory for ground truth CSVs")
-    parser.add_argument("inferred_schemas", type=str, help="Directory for inferred schemas")
+    parser.add_argument("test_jsons", type=str, help="Directory of test JSONs")
+    parser.add_argument("inferred_schemas", type=str, help="Directory of inferred schemas")
     args = parser.parse_args()
 
     os.makedirs(args.inferred_schemas, exist_ok=True)
-    files = [f for f in os.listdir(args.eval_input) if f.endswith("_results.csv")]
+    files = [f for f in os.listdir(args.test_jsons)]
 
     results = []
     with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        futures = {executor.submit(process_single_dataset, f, args.inferred_schemas): f for f in files}
+        futures = {executor.submit(process_single_dataset, args.test_jsons, f, args.inferred_schemas): f for f in files}
         for future in tqdm(as_completed(futures), total=len(futures), desc="Inferring schemas"):
             try:
                 msg, success = future.result()
