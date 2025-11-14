@@ -174,13 +174,16 @@ def save_schema(schema, path):
     with open(path, "w") as f:
         json.dump(schema, f, indent=2)
 
-def process_single_dataset(dataset, inferred_schemas_dir, transformed_schemas_dir, groundtruth_dir, mode, schema_type):
+def process_single_dataset(dataset, inferred_schemas_dir, groundtruth_dir, mode):
     """Process datasets and save transformed schemas."""
+    
 
-    # Check if directory exists
-    os.makedirs(f"{transformed_schemas_dir}_{mode}_{schema_type}", exist_ok=True)
-    transformed_schema_path = os.path.join(f"{transformed_schemas_dir}_{mode}_{schema_type}", dataset)
+    # Create output directory if it doesn't exist
+    transformed_schemas_dir = f"{inferred_schemas_dir}_{mode}"
 
+    os.makedirs(transformed_schemas_dir, exist_ok=True)
+
+    transformed_schema_path = os.path.join(transformed_schemas_dir, dataset)
     # Skip if already processed
     if os.path.exists(transformed_schema_path):
         return f"Skipping {dataset} — already processed.", None
@@ -225,13 +228,9 @@ def main():
     start_time = time.time()
     parser = argparse.ArgumentParser()
     parser.add_argument("inferred_schemas", type=str, help="Directory for inferred schemas")
-    parser.add_argument("transformed_schemas", type=str, help="Directory for transformed schemas")
     parser.add_argument("eval_input", type=str, help="Directory for ground truth CSVs")
     parser.add_argument("mode", type=str, help="Mode: adapter, full, jxplain")
-    parser.add_argument("schema_type", type=str, help="Schema type: baazizi, recg")
     args = parser.parse_args()
-
-    os.makedirs(args.transformed_schemas, exist_ok=True)
 
     files = [f for f in os.listdir(args.inferred_schemas)]
 
@@ -239,12 +238,11 @@ def main():
     with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = {
             executor.submit(
-                process_single_dataset, f, args.inferred_schemas, args.transformed_schemas, args.eval_input, args.mode, args.schema_type
-            ): f
+                process_single_dataset, f, args.inferred_schemas, args.eval_input, args.mode): f
             for f in files
         }
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Tranforming schemas"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"Transforming schemas in {args.mode} mode"):
             msg, success = future.result()
             print(msg, flush=True)
             results.append((msg, success))
