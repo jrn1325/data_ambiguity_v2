@@ -3,710 +3,564 @@ import json
 import numpy as np
 import os
 import pandas as pd
-import random
+import shutil
 import sys
 import torch
 import torch.nn as nn
 import tqdm
 import wandb
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 from adapters import AutoAdapterModel
-from collections import defaultdict
-from copy import deepcopy
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,  precision_recall_fscore_support, classification_report
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,  precision_recall_fscore_support
 from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_scheduler
+from torch.optim import AdamW
+from adapters import SeqBnConfig
+
 
 import warnings
 warnings.filterwarnings("ignore")
 
-# Create constant variables
-DISTINCT_SUBKEYS_UPPER_BOUND = 1000
+# -------------------- Constants --------------------
+MODEL_NAME = "microsoft/codebert-base"
+ADAPTER_PATH = "./adapter-model/adapter"
+FULL_PATH = "./adapter-model/full"
+ADAPTER_NAME = "data_ambiguity"
 BATCH_SIZE = 64
 MAX_TOKEN_LEN = 512
-ADAPTER_NAME = "data_ambiguity"
-MODEL_NAME = "microsoft/codebert-base"
-PATH = "./adapter-model"
-# Use os.path.expanduser to expand '~' to the full home directory path
-SCHEMA_FOLDER = "converted_processed_schemas"
-JSON_FOLDER = "processed_jsons"
-TEMP_FOLDER = "temp_jsons"
-
-RELEVANT_KEYS = {"type", "properties", "items", "required", "additionalProperties", "oneOf", "$ref", "$defs"}
+ACCUMULATION_STEPS = 2
+LEARNING_RATE = 2e-5
+NUM_EPOCHS = 25
+SEED = 101
+SCHEMA_KEYWORDS = ["definitions", "$defs", "properties", "additionalProperties", "patternProperties", "oneOf", "allOf", "anyOf", "items", "type", "not"]
+DISTINCT_SUBKEYS_UPPER_BOUND = 1000
 
 
-# Set the seed value all over the place to make this reproducible.
-seed_val = 42
-random.seed(seed_val)
-np.random.seed(seed_val)
-torch.manual_seed(seed_val)
-torch.cuda.manual_seed_all(seed_val)
-
-
+# -------------------- Early Stopper --------------------
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
-    def __init__(self, patience=1, min_delta=0):
+    def __init__(self, patience=10, min_delta=0.001):
+        """
+        patience: number of validations without improvement before stopping
+        min_delta: minimum change in val loss to qualify as improvement
+        """
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
-        self.min_validation_loss = float('inf')
-    def early_stop(self, validation_loss):
-        if validation_loss < self.min_validation_loss:
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        elif validation_loss > (self.min_validation_loss + self.min_delta):
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        return False
+        self.best_loss = float("inf")
 
+    def early_stop(self, val_loss):
+        """
+        Returns True if training should stop early.
+        """
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            return False
+
+        # No improvement → increase counter
+        self.counter += 1
+
+        # Patience exceeded
+        return self.counter >= self.patience
+
+
+# -------------------- Dataset --------------------
 class CustomDataset(Dataset):
     def __init__(self, dataframe, tokenizer, max_length=MAX_TOKEN_LEN):
-        self.data = dataframe
+        self.labels = torch.tensor(dataframe["label"].values, dtype=torch.long)
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.schemas = dataframe["schema"].tolist()
 
     def __len__(self):
-        return len(self.data)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        schema = self.data.iloc[idx]["schema"]
-        label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
+        schema = ast.literal_eval(self.schemas[idx])
 
-        tokenized_schema = self.tokenizer(
-            json.dumps(schema),
+        # Tokenize schema text (optional)
+        encoding = self.tokenizer(
+            json.dumps(schema["properties"]),
             truncation=True,
             padding="max_length",
-            return_tensors="pt",
-            max_length=self.max_length
+            max_length=self.max_length,
+            return_tensors="pt"
         )
 
+        # Extract numeric features from schema
+        numeric_feats = torch.tensor([
+            schema.get("datatype_entropy", 0.0),
+            schema.get("key_entropy", 0.0),
+            schema.get("parent_frequency", 0.0),
+            schema.get("num_nested_keys", 0.0),
+            float(schema.get("semantic_similarity", 0.0)),
+            float(schema.get("additionalProperties", False))
+        ], dtype=torch.float)
+
         return {
-            "input_ids": tokenized_schema["input_ids"].squeeze(0),
-            "attention_mask": tokenized_schema["attention_mask"].squeeze(0),
-            "label": label
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "numeric_feats": numeric_feats,
+            "labels": self.labels[idx]
         }
 
 def collate_fn(batch):
-    input_ids = torch.stack([item["input_ids"] for item in batch])
-    attention_mask = torch.stack([item["attention_mask"] for item in batch])
-    labels = torch.stack([item["label"] for item in batch])
-
+    input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
+    attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+    numeric_feats = torch.stack([b["numeric_feats"] for b in batch], dim=0)
+    labels = torch.stack([b["labels"] for b in batch], dim=0)
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "label": labels
+        "numeric_feats": numeric_feats,
+        "labels": labels
     }
 
-class CustomEvalDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, max_length=MAX_TOKEN_LEN):
-        self.data = dataframe
-        self.tokenizer = tokenizer
-        self.max_length = max_length
 
-    def __len__(self):
-        return len(self.data)
+# -------------------- Model Initialization & Training & Testing --------------------
+class CustomCodeBERT(nn.Module):
+    def __init__(self, 
+                 model_name=MODEL_NAME, 
+                 num_numeric_features=6, 
+                 num_labels=2, 
+                 dropout=0.3, 
+                 training_mode="adapter"):
+        super().__init__()
+        self.training_mode = training_mode
+        self.num_numeric_features = num_numeric_features
 
-    def __getitem__(self, idx):
-        path = self.data.iloc[idx]["path"]
-        schema = self.data.iloc[idx]["schema"]
-        label = torch.tensor(self.data.iloc[idx]["label"], dtype=torch.long)
+        # Load base model
+        if training_mode == "adapter":
+            self.base_model = AutoAdapterModel.from_pretrained(model_name)
+            self.base_model.config.output_hidden_states = True
 
-        tokenized_schema = self.tokenizer(
-            json.dumps(schema),
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-            max_length=self.max_length
-        )
+            config = SeqBnConfig(
+                mh_adapter=False,
+                output_adapter=True,
+                reduction_factor=16,
+                non_linearity="relu",
+                dropout=dropout
+            )
+            self.base_model.add_adapter(ADAPTER_NAME, config=config)
+            self.base_model.add_classification_head(ADAPTER_NAME, num_labels=num_labels)
+            self.base_model.set_active_adapters(ADAPTER_NAME)
+            self.base_model.train_adapter(ADAPTER_NAME)
 
-        return {
-            "input_ids": tokenized_schema["input_ids"].squeeze(0),
-            "attention_mask": tokenized_schema["attention_mask"].squeeze(0),
-            "label": label,
-            "path": path
-        }
+        else:
+            self.base_model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=num_labels,
+                output_hidden_states=True 
+            )
+            self.base_model.config.output_hidden_states = True
 
-def collate_eval_fn(batch):
-    input_ids = torch.stack([item["input_ids"] for item in batch])
-    attention_mask = torch.stack([item["attention_mask"] for item in batch])
-    labels = torch.stack([item["label"] for item in batch])
-    paths = [item["path"] for item in batch]
+            # Replace classifier
+            if hasattr(self.base_model, "classifier") and isinstance(self.base_model.classifier, nn.Linear):
+                in_features = self.base_model.classifier.in_features
+                out_features = self.base_model.classifier.out_features
+                self.base_model.classifier = nn.Sequential(
+                    nn.Dropout(p=dropout),
+                    nn.Linear(in_features, out_features)
+                )
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "label": labels,
-        "path": paths
-    }
+        # Hidden dimension
+        hidden_size = self.base_model.config.hidden_size
 
-def initialize_model():
+        # Numeric projection
+        self.numeric_proj = nn.Linear(num_numeric_features, hidden_size)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+
+        # Final classifier after concatenation
+        self.classifier = nn.Linear(hidden_size * 2, num_labels)
+
+    def forward(self, input_ids, attention_mask, numeric_feats, labels=None):
+        # Encode inputs
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+
+        # CLS embedding from final layer
+        cls_emb = outputs.hidden_states[-1][:, 0, :]
+
+        # Project numeric features
+        numeric_emb = self.numeric_proj(numeric_feats)
+
+        # Concatenate embeddings
+        combined = torch.cat([cls_emb, numeric_emb], dim=-1)
+        combined = self.dropout(combined)
+
+        # Prediction
+        logits = self.classifier(combined)
+
+        # Loss
+        loss = None
+        if labels is not None:
+            loss = nn.CrossEntropyLoss()(logits, labels)
+
+        return {"logits": logits, "loss": loss, "cls_emb": cls_emb}
+
+def initialize_model(training_mode="adapter"):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
-    model.add_adapter(ADAPTER_NAME, config="seq_bn")
-    model.add_classification_head(ADAPTER_NAME, num_labels=2)
-
-    # Activate the adapter
-    model.set_active_adapters(ADAPTER_NAME)
-    model.train_adapter(ADAPTER_NAME)
-
-    # Enable wandb logging
-    wandb.watch(model)
-
+    model = CustomCodeBERT(training_mode=training_mode)
+    print(f"Initialized {MODEL_NAME} in {training_mode} mode")
     return model, tokenizer
 
-def train_model(train_df, test_df):
-    accumulation_steps = 4
-    learning_rate = 2e-5
-    num_epochs = 25
+def train_model(train_df, test_df, training_mode="adapter"):
+    """
+    Train the model on the training data and evaluate on the test data.
 
-    # Start wandb logging
+    Args:
+        train_df (pd.DataFrame)
+        test_df (pd.DataFrame)
+        training_mode (str): "adapter" or "full"
+    """
+
+    # Initialize W&B
     wandb.init(
         project="custom-codebert_all_files_25",
         config={
-            "accumulation_steps": accumulation_steps,
+            "accumulation_steps": ACCUMULATION_STEPS,
             "batch_size": BATCH_SIZE,
             "dataset": "json-schemas",
-            "epochs": num_epochs,
-            "learning_rate": learning_rate,
+            "epochs": NUM_EPOCHS,
+            "learning_rate": LEARNING_RATE,
             "model_name": MODEL_NAME,
+            "training_mode": training_mode,
+            "adapter_name": ADAPTER_NAME,
         }
     )
 
-    # Initialize model and tokenizer
-    model, tokenizer = initialize_model()
+    # --- Accelerator ---
+    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator.wait_for_everyone()
+    set_seed(SEED)
 
-    # Freeze the base model (CodeBERT)
-    for param in model.parameters():
-        param.requires_grad = False
+    # --- Model + Tokenizer ---
+    model, tokenizer = initialize_model(training_mode)
 
-    # Only train adapter parameters
-    for name, param in model.named_parameters():
-        if "adapter" in name:
-            param.requires_grad = True
-            
-    # Set up optimizer
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    # --- Dataset / DataLoader
+    train_dataset = CustomDataset(train_df, tokenizer)
+    test_dataset = CustomDataset(test_df, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=wandb.config.batch_size, shuffle=True, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=wandb.config.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # Multi-GPU support
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-
-    # Set device
+    # --- Device ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Load dataset
-    train_dataset = CustomDataset(train_df, tokenizer)
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: collate_fn(x))
+    # --- Optimizer & Scheduler ---
+    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=wandb.config.learning_rate)
+    num_training_steps = wandb.config.epochs * len(train_loader) // wandb.config.accumulation_steps
+    scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=int(0.1*num_training_steps), num_training_steps=num_training_steps)
 
-    # Learning rate scheduler
-    num_training_steps = (num_epochs * len(train_dataloader) // accumulation_steps)
-    num_warmup_steps = int(0.1 * num_training_steps) 
-    lr_scheduler = get_linear_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-    )
+    # --- Prepare with accelerator ---
+    model, optimizer, train_loader, test_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, test_loader, scheduler)
 
-    # Early stopping
-    early_stopper = EarlyStopper(patience=5, min_delta=0.005) 
-    step = 0
+    # --- Early stopper ---
+    early_stopper = EarlyStopper(patience=2, min_delta=0.001)
 
-     # Train the model
-    model.train()
-    pbar = tqdm.tqdm(range(num_epochs), position=0, desc="Epoch")
-    for epoch in pbar:
-        total_loss = 0
-        for i, batch in enumerate(tqdm.tqdm(train_dataloader, position=1, leave=False, total=len(train_dataloader))):
-            optimizer.zero_grad()
-            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-            # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            training_loss = outputs.loss
-            training_loss = training_loss.mean()
+    # --- Training loop ---
+    for epoch in range(wandb.config.epochs):
+        model.train()
+        total_loss = 0.0
+        for i, batch in enumerate(tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}")):
+            outputs = model(**batch)
+            loss = outputs["loss"]
+            loss = loss / wandb.config.accumulation_steps
+            accelerator.backward(loss)
+            total_loss += loss.item() * wandb.config.accumulation_steps
 
-            # Normalize loss for gradient accumulation
-            (training_loss / accumulation_steps).backward()
-
-            # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_dataloader):
+            if (i + 1) % wandb.config.accumulation_steps == 0 or (i + 1) == len(train_loader):
                 optimizer.step()
-                lr_scheduler.step()
-                step += 1
+                scheduler.step()
+                optimizer.zero_grad()
+                total_loss += loss.item() * wandb.config.accumulation_steps
 
-            total_loss += training_loss.item()
-        
-        average_loss = total_loss / len(train_dataloader)
+        avg_train_loss = total_loss / len(train_loader)
 
-        # Test the model
-        testing_loss = test_model(test_df, tokenizer, model, device, wandb)
+        # --- Evaluation ---
+        model.eval()
+        all_labels, all_preds = [], []
+        total_eval_loss = 0.0
+        with torch.no_grad():
+            for batch in tqdm.tqdm(test_loader, desc="Testing"):
+                outputs = model(**batch)
+                logits = outputs["logits"]
+                loss = outputs["loss"]
 
+                total_eval_loss += loss.item()
+                preds = torch.argmax(logits, dim=1)
+                all_preds.extend(accelerator.gather(preds).cpu().numpy())
+                all_labels.extend(accelerator.gather(batch["labels"]).cpu().numpy())
+
+        avg_eval_loss = total_eval_loss / len(test_loader)
+
+        # --- Compute per-class metrics ---
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision_per_class = precision_score(all_labels, all_preds, labels=[0,1], average=None)
+        recall_per_class = recall_score(all_labels, all_preds, labels=[0,1], average=None)
+        f1_per_class = f1_score(all_labels, all_preds, labels=[0,1], average=None)
+
+        # --- W&B logging ---
         wandb.log({
-            "training_loss": average_loss,
-            "testing_loss": testing_loss,
-            "learning_rate": lr_scheduler.get_last_lr()[-1], 
-            "step": step,
-            "epoch": epoch + 1
+            "epoch": epoch+1,
+            "training_loss": avg_train_loss,
+            "testing_loss": avg_eval_loss,
+            "accuracy": accuracy,
+            "static precision": precision_per_class[0],
+            "dynamic precision": precision_per_class[1],
+            "static recall": recall_per_class[0],
+            "dynamic recall": recall_per_class[1],
+            "static F1": f1_per_class[0],
+            "dynamic F1": f1_per_class[1],
+            "learning_rate": scheduler.get_last_lr()[0]
         })
 
-        # early stopping
-        early_stop = early_stopper.early_stop(testing_loss)
-        if early_stop:
-            print("Early stopping")
+        print(f"Epoch {epoch+1} - Training Loss: {avg_train_loss:.4f}, Testing Loss: {avg_eval_loss:.4f}, Accuracy: {accuracy:.4f}")
+
+        # --- Early stopping ---
+        if early_stopper.early_stop(avg_eval_loss):
+            print("Early stopping triggered!")
             break
-        
-    # Save the adapter
-    save_model_and_adapter(model)
-    wandb.save(f"{PATH}/*")
+
+    # --- Save adapter only ---
+    accelerator.wait_for_everyone()
+    unwrapped_model = accelerator.unwrap_model(model)
+    save_model_and_adapter(unwrapped_model, training_mode)
     wandb.finish()
 
-def test_model(test_df, tokenizer, model, device, wandb):
+def evaluate_model(test_df, eval_mode="adapter", output_dir="evaluation_results"):
+    """
+    Evaluate the model on the test data, save per-file correct/incorrect predictions to CSVs,
+    and return metrics.
+    """
+    output_dir = output_dir + '_' + eval_mode
+    
+    # delete existing output directory if exists
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Load model and tokenizer ---
+    model, tokenizer = load_model_and_adapter(eval_mode)
+
+    # --- Accelerator ---
+    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator.wait_for_everyone()
+    set_seed(SEED)
+
+    # --- Dataset / DataLoader ---
     test_dataset = CustomDataset(test_df, tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_fn(x))
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn
+    )
 
+    # --- Prepare model & loader ---
+    model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
+
     total_loss = 0.0
+    all_labels, all_preds = [], []
 
-    total_actual_labels = []
-    total_predicted_labels = []
-
+    # --- Evaluation loop ---
     with torch.no_grad():
-        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
-            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["label"].to(device)
-            # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        for batch in tqdm.tqdm(test_loader, desc="Evaluating"):
+            outputs = model(**batch)
+            logits = outputs["logits"]
+            loss = outputs["loss"]
+            total_loss += loss.item()
 
-            # Get the probabilities
-            logits = outputs.logits
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(accelerator.gather(preds).cpu().numpy())
+            all_labels.extend(accelerator.gather(batch["labels"]).cpu().numpy())
 
-            # Calculate the testing loss
-            testing_loss = outputs.loss.mean()
-            total_loss += testing_loss.item()
+    # --- Convert predictions to numpy arrays ---
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
 
-            # Get the actual and predicted labels
-            actual_labels = labels.cpu().numpy()
-            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
-            total_actual_labels.extend(actual_labels)
-            total_predicted_labels.extend(predicted_labels)
-
+    # --- Compute metrics ---
     average_loss = total_loss / len(test_loader)
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision_per_class = precision_score(all_labels, all_preds, labels=[0, 1], average=None)
+    recall_per_class = recall_score(all_labels, all_preds, labels=[0, 1], average=None)
+    f1_per_class = f1_score(all_labels, all_preds, labels=[0, 1], average=None)
 
+    print(f"\n--- Evaluation Results ---")
+    print(f"Test Loss: {average_loss:.4f}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Static (0) -> Precision: {precision_per_class[0]:.4f}, Recall: {recall_per_class[0]:.4f}, F1: {f1_per_class[0]:.4f}")
+    print(f"Dynamic (1) -> Precision: {precision_per_class[1]:.4f}, Recall: {recall_per_class[1]:.4f}, F1: {f1_per_class[1]:.4f}")
 
-   # Overall accuracy (computed on all labels)
-    accuracy = accuracy_score(total_actual_labels, total_predicted_labels)
+    # --- Match predictions back to DataFrame rows ---
+    test_df = test_df.reset_index(drop=True)
+    test_df["pred"] = all_preds
+    test_df["correct"] = test_df["pred"] == test_df["label"]
 
-    # Metrics for the positive class (1)
-    dynamic_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=1)
-    dynamic_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=1)
+    # Keep only essential columns
+    result_df = test_df[["filename", "path", "label", "pred", "correct"]]
 
-    # Metrics for the negative class (0)
-    static_precision = precision_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_recall = recall_score(total_actual_labels, total_predicted_labels, pos_label=0)
-    static_f1 = f1_score(total_actual_labels, total_predicted_labels, pos_label=0)
+    # --- Save per-file CSVs ---
+    for filename, group in result_df.groupby("filename"):
+        file_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_results.csv")
+        group.to_csv(file_path, index=False, sep=';')
+        print(f"Saved: {file_path} ({len(group)} rows)")
 
-    # Log metrics to wandb
-    metrics = {
+    print(f"\nTotal files processed: {result_df['filename'].nunique()}")
+
+    # --- Return metrics and filtered dataframes for further analysis ---
+    correct_df = result_df[result_df["correct"]]
+    incorrect_df = result_df[~result_df["correct"]]
+
+    return {
+        "loss": average_loss,
         "accuracy": accuracy,
-        "dynamic precision": dynamic_precision,
-        "dynamic recall": dynamic_recall,
-        "dynamic F1": dynamic_f1,
-        "static precision": static_precision,
-        "static recall": static_recall,
-        "static F1": static_f1,
+        "precision_per_class": precision_per_class,
+        "recall_per_class": recall_per_class,
+        "f1_per_class": f1_per_class,
+        "correct_df": correct_df,
+        "incorrect_df": incorrect_df,
     }
 
-    # Log metrics to wandb
-    wandb.log(metrics)
-    return average_loss
-    
-def filter_labels_positive(true_labels, predicted_labels):
-    """
-    Filter true and predicted labels for the positive class.
+def save_model_and_adapter(model, training_mode="adapter"):
+    if isinstance(model, nn.DataParallel):
+        model = model.module
 
-    Args:
-        true_labels (list): List of true labels.
-        predicted_labels (list): List of predicted labels.
+    if training_mode == "adapter":
+        os.makedirs(ADAPTER_PATH, exist_ok=True)
 
-    Returns:
-        tuple: Tuple containing filtered true labels and filtered predicted labels for the positive class.
-    """
+        # 1. Save adapter
+        model.base_model.save_adapter(ADAPTER_PATH, ADAPTER_NAME)
 
-    # Get indices where true labels are 1
-    positive_indices = [i for i, label in enumerate(true_labels) if label == 1]
+        # 2. Save pretrained backbone
+        model.base_model.save_pretrained(ADAPTER_PATH)
 
-    # Filter true labels for positive class
-    true_labels_positive = [true_labels[i] for i in positive_indices]
+        # 3. Save custom layers (numeric_proj + classifier + wrapper architecture)
+        torch.save(model.state_dict(), os.path.join(ADAPTER_PATH, "custom_model_weights.pt"))
 
-    # Filter predicted labels for positive class
-    predicted_labels_positive = [predicted_labels[i] for i in positive_indices]
+        print(f"Saved adapter + custom model weights to {ADAPTER_PATH}")
 
-    return true_labels_positive, predicted_labels_positive
+    else:
+        os.makedirs(FULL_PATH, exist_ok=True)
+        model.base_model.save_pretrained(FULL_PATH)
+        torch.save(model.state_dict(), os.path.join(FULL_PATH, "custom_model_weights.pt"))
+        print(f"Saved full fine-tuned model to {FULL_PATH}")
 
-def filter_labels_negative(true_labels, predicted_labels):
-    """
-    Filter true and predicted labels for the negative class.
+def load_model_and_adapter(training_mode="adapter"):
+    # 1. Recreate architecture
+    model = CustomCodeBERT(training_mode=training_mode)
 
-    Args:
-        true_labels (list): List of true labels.
-        predicted_labels (list): List of predicted labels.
-
-    Returns:
-        tuple: Tuple containing filtered true labels and filtered predicted labels for the negative class.
-    """
-
-    # Get indices where true labels are 0 (negative class)
-    negative_indices = [i for i, label in enumerate(true_labels) if label == 0]
-
-    # Filter true labels for negative class
-    true_labels_negative = [true_labels[i] for i in negative_indices]
-
-    # Filter predicted labels for negative class
-    predicted_labels_negative = [predicted_labels[i] for i in negative_indices]
-
-    return true_labels_negative, predicted_labels_negative
-
-def save_model_and_adapter(model):
-    """
-    Save the model's adapter and log it as a WandB artifact.
-
-    Args:
-        model: The model with the adapter to save.
-    """
-
-    path = os.path.join(os.getcwd(), "adapter-model")
-    if isinstance(model, torch.nn.DataParallel):
-        model = model.module    
-    # Save the entire model
-    model.save_pretrained(path)
-
-    # Save the adapter
-    model.save_adapter(path, ADAPTER_NAME)
-    
-def load_model_and_adapter():
-    """
-    Load the model and adapter from the specified path.
-
-    Returns:
-        PreTrainedModel: The model with the loaded adapter.
-    """
-    
-    # Load the tokenizer and model
+    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoAdapterModel.from_pretrained(PATH)
 
-    # Load the adapter from the saved path and activate it
-    adapter_name = model.load_adapter(PATH)
-    model.set_active_adapters(adapter_name)
-    print(f"Loaded and activated adapter: {adapter_name}", flush=True)
-    
+    if training_mode == "adapter":
+        # 2. Load base model (CodeBERT backbone)
+        model.base_model = AutoAdapterModel.from_pretrained(MODEL_NAME)
+        model.base_model.config.output_hidden_states = True
+
+        # 3. Load the saved adapter into the base model
+        adapter_name = model.base_model.load_adapter(ADAPTER_PATH)
+        model.base_model.set_active_adapters(adapter_name)
+
+        # 4. Load your custom layers (numeric_proj + classifier)
+        state = torch.load(os.path.join(ADAPTER_PATH, "custom_model_weights.pt"), map_location="cpu")
+        model.load_state_dict(state, strict=False)
+
+        print("Loaded CustomCodeBERT with adapters from", ADAPTER_PATH)
+
+    else:
+        # Full fine-tuned model
+        model.base_model = AutoModelForSequenceClassification.from_pretrained(FULL_PATH)
+        state = torch.load(os.path.join(FULL_PATH, "custom_model_weights.pt"), map_location="cpu")
+        model.load_state_dict(state)
+        print("Loaded full CustomCodeBERT model.")
+
+    model.eval()
     return model, tokenizer
 
-def run_jxplain(test_df):
+
+
+
+def run_jxplain(test_df, eval_mode="jxplain", output_dir="evaluation_results"):
     """
     Perform the Jxplain method to classify dynamic keys based on datatype entropy 
-    and key entropy. The method calculates and prints performance metrics 
-    (accuracy, precision, recall, and F1 score) for both classes (dynamic and static keys) 
-    as well as combined metrics.
+    and key entropy.
 
     Args:
         test_df (pd.DataFrame): DataFrame containing test data.
-
-    Returns:
-        None: Prints accuracy, precision, recall, and F1 score for both classes.
+        eval_mode (str): Evaluation mode ('jxplain').
+        output_dir (str): Directory to save evaluation results.
     """
     
     # Perform Jxplain: Predict if a key is dynamic (1) based on entropy conditions
-    y_pred = ((test_df["datatype_entropy"] == 1) & (test_df["key_entropy"] > 1)).astype(int)
+    y_pred = ((test_df["datatype_entropy"] == 0) & (test_df["key_entropy"] > 1)).astype(int)
     y_test = test_df["label"]
 
-    # Calculate per-class metrics (returns arrays: [class_0, class_1])
-    precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average=None)
+    # Calculate overall accuracy
+    overall_accuracy = accuracy_score(y_test, y_pred)
 
-    precision_0, precision_1 = precision
-    recall_0, recall_1 = recall
-    f1_0, f1_1 = f1
+    # Calculate precision, recall, and F1-score for both classes
+    precision, recall, f1_score, support = precision_recall_fscore_support(y_test, y_pred, average=None, labels=[0, 1])
 
-    # Calculate overall metrics
-    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(y_test, y_pred, average="weighted")
-    accuracy = accuracy_score(y_test, y_pred)
+    # Calculate combined metrics (macro average)
+    combined_precision, combined_recall, combined_f1, _ = precision_recall_fscore_support(y_test, y_pred, average='weighted')
 
-    # Print per-class metrics
-    print(f"Class 0 (Static) - Precision: {precision_0:.4f}, Recall: {recall_0:.4f}, F1 Score: {f1_0:.4f}")
-    print(f"Class 1 (Dynamic) - Precision: {precision_1:.4f}, Recall: {recall_1:.4f}, F1 Score: {f1_1:.4f}")
+    # Calculate accuracy for positive and negative classes
+    positive_accuracy = accuracy_score(y_test[y_test == 1], y_pred[y_test == 1])
+    negative_accuracy = accuracy_score(y_test[y_test == 0], y_pred[y_test == 0])
 
-    # Print overall metrics
-    print(f"Overall (Weighted) - Precision: {precision_macro:.4f}, Recall: {recall_macro:.4f}, F1 Score: {f1_macro:.4f}, Accuracy: {accuracy:.4f}")
+    print(f"Class 0 (Static) - Precision: {precision[0]:.4f}, Recall: {recall[0]:.4f}, F1 Score: {f1_score[0]:.4f}, Accuracy: {negative_accuracy:.4f}")
+    print(f"Class 1 (Dynamic) - Precision: {precision[1]:.4f}, Recall: {recall[1]:.4f}, F1 Score: {f1_score[1]:.4f}, Accuracy: {positive_accuracy:.4f}")
+    print(f"Both Classes (Overall) - Precision: {combined_precision:.4f}, Recall: {combined_recall:.4f}, F1 Score: {combined_f1:.4f}, Accuracy: {overall_accuracy:.4f}")
 
 
-def evaluate_model(test_df):
-    """
-    Evaluate the model on the test data and collect correctly predicted dynamic paths.
+    # --- Match predictions back to DataFrame rows ---
+    test_df = test_df.reset_index(drop=True)
+    test_df["pred"] = y_pred
+    test_df["correct"] = test_df["pred"] == test_df["label"]
 
-    Args:
-        test_df (pd.DataFrame): DataFrame with test examples.
+    # Keep only essential columns
+    result_df = test_df[["filename", "path", "label", "pred", "correct"]]
 
-    Returns:
-        dynamic_paths (list): Paths where the model correctly predicted dynamic (label=1).
-    """
-    model, tokenizer = load_model_and_adapter()
-
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    test_dataset = CustomEvalDataset(test_df, tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda x: collate_eval_fn(x))
-
-    dynamic_paths = []
-    index = 0
-
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm.tqdm(test_loader, total=len(test_loader)):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["label"].to(device)
-
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            logits = outputs.logits
-            preds = torch.argmax(logits, dim=1)
-
-            for i in range(len(preds)):
-                true_label = labels[i].item()
-                pred_label = preds[i].item()
-                if pred_label == true_label == 1:
-                    dynamic_paths.append(ast.literal_eval(test_df.iloc[index]["path"]))
-                index += 1
-
-    return dynamic_paths
-
-def strip_schema(schema):
-    """
-    Strip schema to keep only type and nested properties.
+    output_dir = output_dir + '_' + eval_mode
+    os.makedirs(output_dir, exist_ok=True)
     
-    Args:
-        schema (dict or set): The JSON Schema to be stripped.   
-        
-    Returns:
-        dict: A simplified version of the schema containing only the type and properties.
-    """
-    if isinstance(schema, set):
-        return list(schema)
-    if not isinstance(schema, dict):
-        return schema
-
-    new_schema = {}
-    for key, value in schema.items():
-        if key == "type":
-            new_schema["type"] = list(value) if isinstance(value, set) else value
-        elif key == "properties":
-            new_schema["properties"] = {
-                k: strip_schema(v)
-                for k, v in value.items()
-            }
-    return new_schema
-
-def normalize_type(t):
-    """
-    Normalize a JSON Schema type to a list of strings.
-    
-    Args:
-        t (str, list, or None): The type to normalize. 
-    Returns:
-        list: A list of strings representing the normalized type.
-    """
-    if t is None:
-        return ["object"]
-    if isinstance(t, str):
-        return [t]
-    if isinstance(t, list):
-        return t
-    return ["object"]
-
-def nest_schema(group_df, dynamic_paths=None, abstract_dynamic=True):
-    """
-    Nest the JSON Schema based on the paths and schemas in the DataFrame.
-    
-    Args:
-        group_df (pd.DataFrame): DataFrame containing paths and schemas.
-        dynamic_paths (list, optional): List of dynamic paths to abstract. Defaults to None.
-        abstract_dynamic (bool, optional): Whether to abstract dynamic paths. Defaults to True.
-    Returns:
-        dict: A nested JSON Schema.
-    """
-    if dynamic_paths is None:
-        dynamic_paths = []
-
-    root = {"type": "object", "properties": {}}
-    dynamic_collected = defaultdict(list)  # key: dynamic path, value: list of types
-
-    for _, row in group_df.iterrows():
-        path = ast.literal_eval(row["path"])
-        schema = strip_schema(ast.literal_eval(row["schema"]))
-
-        matched_dynamic = path if path in dynamic_paths else None
-
-        node = root
-        for i, part in enumerate(path):
-            is_last = (i == len(path) - 1)
-            node = node.setdefault("properties", {}).setdefault(part, {"type": "object"})
-
-            if abstract_dynamic and matched_dynamic and is_last:
-                # Abstract this leaf node with additionalProperties
-                node.clear()
-                node["type"] = "object"
-                node["additionalProperties"] = {}
-
-                # Collect the types of all nested properties
-                for subkey, subschema in schema.get("properties", {}).items():
-                    dynamic_collected[matched_dynamic].append(normalize_type(subschema.get("type")))
-                break
-
-            if is_last:
-                node.update(schema)
-
-    # Post-process dynamic paths to assign unioned types in additionalProperties
-    for dp, types_list in dynamic_collected.items():
-        node = root
-        for part in dp[:-1]:
-            node = node.get("properties", {}).get(part, {})
-        leaf_key = dp[-1]
-        leaf_node = node.get("properties", {}).get(leaf_key, {})
-
-        if "additionalProperties" in leaf_node:
-            all_types = set()
-            for types in types_list:
-                all_types.update(types if isinstance(types, list) else [types])
-            leaf_node["additionalProperties"]["type"] = sorted(all_types) if all_types else ["object"]
-
-    return root
-
-
-
-
-
-
-
-def compare_json_schemas(original_schema, abstracted_schema):
-    """
-    Compare the size of two JSON Schemas in kilobytes (KB).
-
-    Args:
-        original_schema (dict): The original JSON Schema.
-        abstracted_schema (dict): The abstracted JSON Schema.
-
-    Returns:
-        dict: A dictionary containing the size in KB of both schemas.
-    """
-    #original_schema_str = json.dumps(original_schema, indent=2)
-    #abstracted_schema_str = json.dumps(abstracted_schema, indent=2)
-    original_schema_str = json.dumps(original_schema, separators=(',', ':'))
-    abstracted_schema_str = json.dumps(abstracted_schema, separators=(',', ':'))
-
-    comparison = {
-        "kilobytes": {
-            "original_schema": round(len(original_schema_str.encode("utf-8")) / 1024, 2),
-            "abstracted_schema": round(len(abstracted_schema_str.encode("utf-8")) / 1024, 2),
-            "reduction": round((len(original_schema_str.encode("utf-8")) - len(abstracted_schema_str.encode("utf-8"))) / len(original_schema_str.encode("utf-8")) * 100, 2) if len(original_schema_str.encode("utf-8")) > 0 else 0
-        }
-    }
-
-    return comparison
-
-def eval_dataset(test_df):
-    results = {}
-    total_original = 0
-    total_abstracted = 0
-    total_reduction = 0
-    count = 0
-
-    for filename, group_df in tqdm.tqdm(
-        test_df.groupby("filename"),
-        desc="Evaluating datasets",
-        total=len(test_df["filename"].unique())
-    ):
-        
-        #if filename != "alacritty-configuration-schema.json":
-        #    continue
-
-
-        print(f"Evaluating model on: {filename} with {len(group_df)} unique paths", flush=True)
-        dynamic_paths = evaluate_model(group_df)
-
-        original_schema = nest_schema(group_df, dynamic_paths, abstract_dynamic=False)
-        abstracted_schema = nest_schema(group_df, dynamic_paths, abstract_dynamic=True)
-        
-        # Save the original and abstracted schemas to files
-        original_schema_path = os.path.join(TEMP_FOLDER, f"{filename}_original.json")
-        abstracted_schema_path = os.path.join(TEMP_FOLDER, f"{filename}_abstracted.json")
-        with open(original_schema_path, "w") as f:
-            json.dump(original_schema, f, indent=2)
-        with open(abstracted_schema_path, "w") as f:
-            json.dump(abstracted_schema, f, indent=2)
-
-        stats = compare_json_schemas(original_schema, abstracted_schema)
-        results[filename] = stats
-
-        original_kb = stats["kilobytes"]["original_schema"]
-        abstracted_kb = stats["kilobytes"]["abstracted_schema"]
-
-        total_original += original_kb
-        total_abstracted += abstracted_kb
-
-        # Calculate reduction if original size > 0 to avoid division by zero
-        if original_kb > 0:
-            reduction = (original_kb - abstracted_kb) / original_kb
-        else:
-            reduction = 0
-        total_reduction += reduction
-
-        count += 1
-
-    average_stats = {
-        "average_kilobytes": {
-            "original_schema": round(total_original / count, 2) if count > 0 else 0,
-            "abstracted_schema": round(total_abstracted / count, 2) if count > 0 else 0,
-        },
-        "average_reduction": round(total_reduction / count, 4) if count > 0 else 0
-    }
-
-    results["summary"] = average_stats
-
-    print(json.dumps(results, indent=2))
-
-
+    # --- Save per-file CSVs ---
+    for filename, group in result_df.groupby("filename"):
+        file_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_results.csv")
+        group.to_csv(file_path, index=False, sep=';')
+        print(f"Saved: {file_path} ({len(group)} rows)")
 
 
 def main():
     try:
-        # Parse command-line arguments
-        train_data, test_data, mode = sys.argv[-3:]
-
-        # Ensure mode is valid
+        train_data, test_data, mode, *extra = sys.argv[-4:]
+        version = extra[0].lower() if extra else "adapter"
+        if version not in {"adapter", "full", "jxplain"}:
+            raise ValueError("Invalid training mode. Use 'adapter', 'full', or 'jxplain'.")
         if mode not in {"train", "eval", "jxplain"}:
-            raise ValueError("Invalid mode. Use 'train' or 'test'.")
-        
+            raise ValueError("Invalid mode. Use 'train', 'eval', or 'jxplain'.")
+
         if mode == "train":
-            train_df = pd.read_csv(train_data, sep=";")
-            test_df = pd.read_csv(test_data, sep=";")
-            train_model(train_df, test_df)
+            train_df = pd.read_csv(train_data, delimiter=';')
+            test_df = pd.read_csv(test_data, delimiter=';')
+            train_model(train_df, test_df, version)
         elif mode == "eval":
-            test_df = pd.read_csv(test_data, sep=";")
-            eval_dataset(test_df)
-        elif mode == "jxplain":
-            test_df = pd.read_csv(test_data, sep=";")
-            run_jxplain(test_df)
+            test_df = pd.read_csv(test_data, delimiter=';')
+            model, _ = load_model_and_adapter(version)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if torch.cuda.device_count() > 1:
+                model = nn.DataParallel(model)
+            model.to(device)
+            evaluate_model(test_df, eval_mode=version)
+        else:
+            test_df = pd.read_csv(test_data, delimiter=';')
+            run_jxplain(test_df, eval_mode=version, output_dir="evaluation_results")
 
     except (ValueError, IndexError) as e:
-        print(f"Error: {e}\nUsage: script.py <train_data> <test_data> <mode>")
+        print(f"Error: {e}\nUsage: script.py <train_data> <test_data> <mode> [adapter|full|jxplain]")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
