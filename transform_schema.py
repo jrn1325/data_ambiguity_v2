@@ -8,6 +8,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from tqdm import tqdm
 
+ARRAY_WILDCARD = "<ARRAY_ITEM>"
+
 def normalize_dynamic_paths(dynamic_paths):
     """
     Normalize string to tuples like ('$', 'build', 'gpu').
@@ -35,22 +37,33 @@ def normalize_dynamic_paths(dynamic_paths):
     return sorted(normalized, key=len, reverse=True)
 
 def normalize_additional_properties(parent):
-    """Ensure parent['additionalProperties'] is a dict."""
+    """Ensure parent['additionalProperties'] is a dict and return it."""
+    
     ap = parent.get("additionalProperties")
 
-    if ap in (True, None):
+    # Treat None, True, and False as empty dicts
+    if ap in (None, True, False):
         ap = {}
         parent["additionalProperties"] = ap
-    elif ap is False:
-        ap = {}
-        parent["additionalProperties"] = ap
-    elif not isinstance(ap, dict):
-        raise TypeError(f"Unexpected additionalProperties type: {type(ap)}")
+        return ap
 
-    return ap
+    # If already a dict, ensure it's stored and return it
+    if isinstance(ap, dict):
+        parent["additionalProperties"] = ap
+        return ap
+
+    # Unsupported type
+    raise TypeError(f"Unexpected additionalProperties type: {type(ap)}")
+
 
 def merge_dynamic_schema(ap, dynamic_schema):
-    """Merge a dynamic schema into an existing additionalProperties."""
+    """
+    Merge a dynamic schema into an existing additionalProperties.
+
+    Args:
+        ap (dict): existing additionalProperties schema.
+        dynamic_schema (dict): dynamic schema to merge.
+    """
     if not ap:
         ap.update(dynamic_schema)
     else:
@@ -71,7 +84,10 @@ def merge_dynamic_schema(ap, dynamic_schema):
 def process_path(schema, keys):
     """
     Traverse the schema following the provided path, removing the dynamic key.
-    Supports '*' as a wildcard for array indices.
+
+    Args:
+        schema (dict): JSON schema.
+        keys (list): List of keys representing the path.    
     """
     if not keys:
         return
@@ -86,14 +102,21 @@ def process_path(schema, keys):
             if not remaining:
                 # Dynamic key found
                 dynamic_schema = props.pop(key)
+
+                if "required" in schema and key in schema["required"]:
+                    schema["required"].remove(key)
+                    # Remove empty required lists (optional)
+                    if len(schema["required"]) == 0:
+                        del schema["required"]
+
                 ap = normalize_additional_properties(schema)
                 merge_dynamic_schema(ap, dynamic_schema)
             else:
                 process_path(props[key], remaining)
 
-    # Array case (including wildcard '*')
+    # Array case
     elif schema.get("type") == "array" and "items" in schema:
-        if key == "*":
+        if key == ARRAY_WILDCARD:
             # Wildcard: apply to the array's items
             process_path(schema["items"], remaining)
         else:
@@ -111,6 +134,12 @@ def transform_schema_with_dynamic_keys(schema, dynamic_paths):
     Transform a Baazizi-style inferred schema by removing dynamic keys recursively,
     merging their structures into `additionalProperties` while preserving constraints.
     Handles schemas that start with anyOf/oneOf/allOf.
+
+    Args:
+        schema (dict): JSON schema.
+        dynamic_paths (list): List of dynamic paths as tuples.
+    Returns:
+        dict: Transformed JSON schema.
     """
     transformed = deepcopy(schema)
     parsed_paths = normalize_dynamic_paths(dynamic_paths)
@@ -120,8 +149,6 @@ def transform_schema_with_dynamic_keys(schema, dynamic_paths):
         process_path(transformed, keys)
 
     return transformed
-
-
 
 def get_schema_size(schema):
     """
@@ -180,11 +207,10 @@ def process_single_dataset(dataset, inferred_schemas_dir, groundtruth_dir, mode)
 
     # Create output directory if it doesn't exist
     transformed_schemas_dir = f"{inferred_schemas_dir}_{mode}"
-
     os.makedirs(transformed_schemas_dir, exist_ok=True)
 
-    transformed_schema_path = os.path.join(transformed_schemas_dir, dataset)
     # Skip if already processed
+    transformed_schema_path = os.path.join(transformed_schemas_dir, dataset)
     if os.path.exists(transformed_schema_path):
         return f"Skipping {dataset} — already processed.", None
 
@@ -198,10 +224,7 @@ def process_single_dataset(dataset, inferred_schemas_dir, groundtruth_dir, mode)
         groundtruth = pd.read_csv(groundtruth_path, sep=";")
 
         # Extract dynamic paths and sort bottom-up
-        dynamic_paths = groundtruth[
-            (groundtruth["label"] == 1) & (groundtruth["correct"] == True)
-        ]["path"].tolist()
-        dynamic_paths = sorted(dynamic_paths, key=len, reverse=True)
+        dynamic_paths = groundtruth[(groundtruth["pred"] == 1)]["path"].tolist()
         dynamic_paths = normalize_dynamic_paths(dynamic_paths)
         print(f"Processing {dataset}: Found {len(dynamic_paths)} dynamic paths.", flush=True)
 
