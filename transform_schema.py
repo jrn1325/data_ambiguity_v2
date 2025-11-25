@@ -55,7 +55,6 @@ def normalize_additional_properties(parent):
     # Unsupported type
     raise TypeError(f"Unexpected additionalProperties type: {type(ap)}")
 
-
 def merge_dynamic_schema(ap, dynamic_schema):
     """
     Merge a dynamic schema into an existing additionalProperties.
@@ -81,21 +80,52 @@ def merge_dynamic_schema(ap, dynamic_schema):
             ap.clear()
             ap.update(only_schema)
 
-def process_path(schema, keys):
+def resolve_ref(ref, root_schema):
+    """
+    Resolves an internal $ref like '#/definitions/User'.
+    Returns a pointer directly to the referenced dict.
+
+    Args:
+        ref (str): The $ref string.
+        root_schema (dict): The root JSON schema.
+    Returns:
+        dict or None: The referenced schema dict, or None if not found.
+    """
+    assert ref.startswith("#/"), "Only internal refs supported."
+
+    path = ref[2:].split("/")  # ['definitions', 'User']
+    target = root_schema
+    for p in path:
+        if p in target:
+            target = target[p]
+        else:
+            return None
+    return target
+
+def process_path(schema, keys, root):
     """
     Traverse the schema following the provided path, removing the dynamic key.
 
     Args:
         schema (dict): JSON schema.
-        keys (list): List of keys representing the path.    
+        keys (list): List of keys representing the path. 
+        root (dict): Root schema for resolving $refs.   
     """
     if not keys:
         return
+    
+    # Handle $ref
+    if "$ref" in schema:
+        resolved = resolve_ref(schema["$ref"], root)
+        if resolved is None:
+            return
+        # Continue traversal in the referenced definition
+        return process_path(resolved, keys, root)
 
     key = keys[0]
     remaining = keys[1:]
 
-    # Object case
+    # Handle object
     if schema.get("type") == "object" and "properties" in schema:
         props = schema["properties"]
         if key in props:
@@ -105,29 +135,37 @@ def process_path(schema, keys):
 
                 if "required" in schema and key in schema["required"]:
                     schema["required"].remove(key)
-                    # Remove empty required lists (optional)
+                    # Remove empty required lists
                     if len(schema["required"]) == 0:
                         del schema["required"]
 
                 ap = normalize_additional_properties(schema)
                 merge_dynamic_schema(ap, dynamic_schema)
             else:
-                process_path(props[key], remaining)
+                process_path(props[key], remaining, root)
 
-    # Array case
+    # Handle array (items)
     elif schema.get("type") == "array" and "items" in schema:
         if key == ARRAY_WILDCARD:
             # Wildcard: apply to the array's items
-            process_path(schema["items"], remaining)
-        else:
-            # Rare case: explicit numeric index (if ever appears)
-            process_path(schema["items"], keys)
+            process_path(schema["items"], remaining, root)
+
+    # Handle array (prefixItems)
+    elif schema.get("type") == "array" and "prefixItems" in schema:
+        if key == ARRAY_WILDCARD:
+            # Traverse each prefix item schema
+            for subschema in schema["prefixItems"]:
+                process_path(subschema, remaining, root)
+
+            # Traverse the 'items' schema for additional items, if it exists
+            if "items" in schema:
+                process_path(schema["items"], remaining, root)
 
     # Handle schema combinators (anyOf, oneOf, allOf)
     for combiner in ("anyOf", "oneOf", "allOf"):
         if combiner in schema:
             for sub_schema in schema[combiner]:
-                process_path(sub_schema, keys)
+                process_path(sub_schema, keys, root)
 
 def transform_schema_with_dynamic_keys(schema, dynamic_paths):
     """
@@ -146,7 +184,7 @@ def transform_schema_with_dynamic_keys(schema, dynamic_paths):
 
     for path in parsed_paths:
         keys = path[1:]  # skip '$'
-        process_path(transformed, keys)
+        process_path(transformed, keys, transformed)
 
     return transformed
 
@@ -219,12 +257,16 @@ def process_single_dataset(dataset, inferred_schemas_dir, groundtruth_dir, mode)
         inferred_schema_path = os.path.join(inferred_schemas_dir, dataset)
         inferred_schema = load_schema(inferred_schema_path)
 
-        # Load groundtruth data
-        groundtruth_path = os.path.join(groundtruth_dir + "_" + mode, dataset.replace(".json", "_results.csv"))
-        groundtruth = pd.read_csv(groundtruth_path, sep=";")
-
         # Extract dynamic paths and sort bottom-up
-        dynamic_paths = groundtruth[(groundtruth["pred"] == 1)]["path"].tolist()
+        if mode == "gt":
+            # Load groundtruth data
+            groundtruth_path = os.path.join(groundtruth_dir + "_adapter", dataset.replace(".json", "_results.csv"))
+            groundtruth = pd.read_csv(groundtruth_path, sep=";")
+            dynamic_paths = groundtruth[(groundtruth["label"] == 1)]["path"].tolist()
+        else:
+            groundtruth_path = os.path.join(groundtruth_dir + "_" + mode, dataset.replace(".json", "_results.csv"))
+            groundtruth = pd.read_csv(groundtruth_path, sep=";")
+            dynamic_paths = groundtruth[(groundtruth["pred"] == 1)]["path"].tolist()
         dynamic_paths = normalize_dynamic_paths(dynamic_paths)
         print(f"Processing {dataset}: Found {len(dynamic_paths)} dynamic paths.", flush=True)
 
@@ -252,7 +294,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("inferred_schemas", type=str, help="Directory for inferred schemas")
     parser.add_argument("eval_input", type=str, help="Directory for ground truth CSVs")
-    parser.add_argument("mode", type=str, help="Mode: adapter, full, jxplain")
+    parser.add_argument("mode", type=str, help="Mode: adapter, full, jxplain, gt")
     args = parser.parse_args()
 
     files = [f for f in os.listdir(args.inferred_schemas)]
