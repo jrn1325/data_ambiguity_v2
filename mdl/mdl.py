@@ -17,7 +17,7 @@ def MDLExperiment(schema_path, instance_path):
     # algorithm, dataset, exp_num, train_perc
 
     # 1. Get schema and dataset
-    print("[1. Loading Instances and Schemas...]")
+    print(f"[1. Loading Instances and Schemas...] \nSchema Path: {schema_path}\nInstance Path: {instance_path}\n")
     
     schema = load_schema(schema_path)
     original_schema = deepcopy(schema)
@@ -73,10 +73,13 @@ def MDLExperiment(schema_path, instance_path):
     for success_bit in success_bits:
         if success_bit:
             successes += 1
-    for drc_value in drc_values:
-        #drc_value /= len(instances)  # Justin added len(instances)
-        total_drc += drc_value
-    drc = total_drc
+    #for drc_value in drc_values:
+    #    total_drc += drc_value
+    total_drc = sum(drc_values)
+    drc = total_drc / len(instances)
+
+    
+    #drc = total_drc
     print("[4. Aggregating Results Complete]")
     return src, drc, successes
 
@@ -91,8 +94,8 @@ def runner(inp):
 def calculateSRCRecursive(schema, distinct_labels_num):
     bit_size = bitSize(distinct_labels_num + METACHAR_NUM)
 
-    if isinstance(schema, bool): # Justin Added this
-        return 0
+    #if isinstance(schema, bool): # Justin Added this
+    #    return 0
 
     if "type" in schema and schema["type"] == "object":
         if isEmptyObjectSchema(schema):
@@ -362,12 +365,12 @@ def calculateDRCRecursive(instance, schema, original_schema, kleene_bits, obj_le
         elif isArraySchemaWithNoKeys(schema):
             return True, calculateUnacceptedInstanceDRC(instance, distinct_labels_num)
         
-        if schema == {}:# Justin Added this
+        #if schema == {}:# Justin Added this
             # Accept all values when schema is empty
-            if isinstance(instance, list):
-                return True, bitSize(len(instance)) 
-            else:
-                return True, 0
+        #    if isinstance(instance, list):
+        #        return True, bitSize(len(instance)) 
+        #    else:
+        #        return True, 0
         else:
             print(json.dumps(schema))
             print(json.dumps(instance))
@@ -555,38 +558,36 @@ def bitSize(length):
 
 
 def main(argv):
-    original_schemas = "converted_processed_schemas/"
     start_time = time.time()
     parser = argparse.ArgumentParser(description="Using MDL to evaluate JSON Schema quality on datasets")
     parser.add_argument("dataset_dir", help="Directory containing datasets corresponding to the schemas")
     parser.add_argument("schema_dir", help="Directory containing JSON Schema files")
     parser.add_argument("output_dir", help="Directory to save the output results")
-    parser.add_argument("mode", help="Mode of operation", choices=["adapter", "full", "jxplain", "infer", "gt"])
+    parser.add_argument("mode", help="Mode of operation", choices=["adapter", "full", "jxplain", "infer", "gt", "fake"])
     args = parser.parse_args(argv)
     print(f"[INFO] Running with args: {args}")
 
     dataset_dir = args.dataset_dir
     mode = args.mode
+    output_dir = args.output_dir
+
     if mode != "infer":
-        schema_dir = f"{args.schema_dir}_{args.mode}"
+        schema_dir = args.schema_dir + f"_{mode}"
     else:
         schema_dir = args.schema_dir
 
-    output_dir = args.output_dir
-
     out_path = os.path.join(output_dir, f"{schema_dir}_mdl_scores.json")
+
     result_list = []
 
-    for schema in os.listdir(schema_dir):
-        if mode == "gt":
-            schema_path = os.path.join(original_schemas, schema)
-        else:   
-            schema_path = os.path.join(schema_dir, schema)
-            
+    for schema in os.listdir(schema_dir):  
+        schema_path = os.path.join(schema_dir, schema)
+        print(f"[INFO] Processing Schema: {schema_path}")
         dataset_path = os.path.join(dataset_dir, schema)
 
         # Skip non-JSON files if needed
         if not os.path.isfile(schema_path):
+            print(f"[WARNING] Skipping non-file: {schema_path}")
             continue
 
         # Run MDL Experiment
