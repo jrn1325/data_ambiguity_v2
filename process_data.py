@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import json
 import math
 import numpy as np
@@ -260,16 +261,16 @@ def extract_paths(doc, path=("$",)):
     else:
         raise ValueError(f"Expected dict or list, got {type(doc).__name__}")
 
-def process_document(doc, path_types_dict, parent_frequency_dict):
+def process_document(doc, path_types, path_freqs):
     """
     Extracts paths from the given JSON document and stores them in dictionaries,
     grouping paths that share the same prefix and capturing the frequency and data type of nested keys.
 
     Args:
-        doc (dict): The JSON document to process.
-        path_types_dict (defaultdict): A dictionary to store path types and frequencies.
-        parent_frequency_dict (defaultdict): A dictionary to store parent path frequencies.
-    """
+        doc: JSON document
+        path_types: dict mapping path tuples to type information
+        path_freqs: Counter for path frequencies
+    """ 
     for path, value in extract_paths(doc):
         if len(path) > 1:
             nested_key = path[-1]
@@ -279,18 +280,18 @@ def process_document(doc, path_types_dict, parent_frequency_dict):
             prefix = path[:-1]
             value_type = get_json_format(value)
 
-            if prefix not in path_types_dict:
-                path_types_dict[prefix] = {}
+            if prefix not in path_types:
+                path_types[prefix] = {}
 
-            if nested_key not in path_types_dict[prefix]:
-                path_types_dict[prefix][nested_key] = {"frequency": 0, "type": set()}
-
+            if nested_key not in path_types[prefix]:
+                path_types[prefix][nested_key] = {"frequency": 0, "type": set()}
+            
             # Update frequency and type for the nested key
-            path_types_dict[prefix][nested_key]["frequency"] += 1
-            path_types_dict[prefix][nested_key]["type"].add(value_type)
+            path_types[prefix][nested_key]["frequency"] += 1
+            path_types[prefix][nested_key]["type"].add(value_type)
 
             # Update parent frequency (number of times this object appears)
-            parent_frequency_dict[prefix] = parent_frequency_dict.get(prefix, 0) + 1
+            path_freqs[prefix] = path_freqs.get(prefix, 0) + 1
 
 def get_embeddings(nested_keys):
     """
@@ -330,25 +331,25 @@ def calc_semantic_similarity(nested_keys):
 
     return round(avg_similarity, 3)
 
-def create_dataframe(path_types_dict, parent_frequency_dict, dataset):
+def create_dataframe(path_values, path_freqs, dataset):
     """
-    Create a DataFrame from the path types and parent frequencies.
+    Create a DataFrame from the path values and parent frequencies.
 
     Args:
-        path_types_dict (defaultdict): A dictionary containing path types and frequencies.
-        parent_frequency_dict (defaultdict): A dictionary containing parent path frequencies.
+        path_values (defaultdict): A dictionary containing path values and frequencies.
+        path_freqs (Counter): A Counter containing path frequencies.
         dataset (str): The name of the dataset.
     Returns:
         pd.DataFrame: A DataFrame containing the processed data.
     """
     data = []
 
-    for path, nested_keys in path_types_dict.items():
+    for path, nested_keys in path_values.items():
         schema_info = {"properties": {}}
         values_types = set()
         frequencies = []
 
-        parent_frequency = parent_frequency_dict.get(path, 0)
+        parent_frequency = path_freqs.get(path, 0)
         observed_keys = set(nested_keys.keys())
         required_keys = []
 
@@ -486,9 +487,8 @@ def process_dataset(dataset):
         tuple: (pd.DataFrame or None, list of valid JSON documents)
     """
 
-    path_types_dict = defaultdict(lambda: defaultdict(lambda: {"frequency": 0, "type": set()}))
-    parent_frequency_dict = defaultdict(int)
-    
+    path_values = defaultdict(lambda: defaultdict(lambda: {"frequency": 0, "type": set()}))
+    path_freqs = Counter()
     valid_docs = []
 
     # Load the schema
@@ -505,22 +505,22 @@ def process_dataset(dataset):
             try: 
                 doc = json.loads(line)
                 if isinstance(doc, dict) and match_properties(schema, doc):
-                    process_document(doc, path_types_dict, parent_frequency_dict)
+                    process_document(doc, path_values, path_freqs)
                     valid_docs.append(doc)
                 elif isinstance(doc, list):
                     for item in doc:
                         if isinstance(item, dict) and match_properties(schema, item):
-                            process_document(item, path_types_dict, parent_frequency_dict)
+                            process_document(item, path_values, path_freqs)
                             valid_docs.append(item)
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
 
-    if len(path_types_dict) == 0:
+    if len(path_values) == 0:
         print(f"No paths of type object extracted from {dataset}.")
         return None, valid_docs
 
-    df = create_dataframe(path_types_dict, parent_frequency_dict, dataset)
+    df = create_dataframe(path_values, path_freqs, dataset)
     print(f"Dataset: {dataset}, Total Paths: {len(df)}, Static Paths: {len(static_paths)}", flush=True)
     df = label_paths(df, static_paths)
 

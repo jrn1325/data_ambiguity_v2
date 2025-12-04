@@ -109,6 +109,7 @@ def process_documents(dataset_name, dataset_path):
         dataset_path (str): Path to the dataset file.
     """
     output_path = os.path.join(PROCESSED_JSONS_FOLDER, dataset_name)
+
     try:
         with open(dataset_path, 'r', encoding='utf-8') as infile, \
              open(output_path, 'w', encoding='utf-8') as outfile:
@@ -127,7 +128,6 @@ def process_documents(dataset_name, dataset_path):
                     
     except Exception as e:
         print(f"Error processing documents for {dataset_name}: {e}", flush=True)
-
 
 def process_single_dataset(dataset_name):
     """

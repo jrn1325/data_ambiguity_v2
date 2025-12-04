@@ -11,13 +11,11 @@ import tqdm
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from adapters import AutoAdapterModel
+from adapters import AutoAdapterModel, SeqBnConfig
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,  precision_recall_fscore_support
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_scheduler
-from torch.optim import AdamW
-from adapters import SeqBnConfig
-
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -28,7 +26,7 @@ ADAPTER_PATH = "./adapter-model/adapter"
 FULL_PATH = "./adapter-model/full"
 ADAPTER_NAME = "data_ambiguity"
 BATCH_SIZE = 64
-MAX_TOKEN_LEN = 512
+MAX_TOK_LEN = 512
 ACCUMULATION_STEPS = 2
 LEARNING_RATE = 2e-5
 NUM_EPOCHS = 25
@@ -68,7 +66,7 @@ class EarlyStopper:
 
 # -------------------- Dataset --------------------
 class CustomDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, max_length=MAX_TOKEN_LEN):
+    def __init__(self, dataframe, tokenizer, max_length=MAX_TOK_LEN):
         self.labels = torch.tensor(dataframe["label"].values, dtype=torch.long)
         self.tokenizer = tokenizer
         self.max_length = max_length
