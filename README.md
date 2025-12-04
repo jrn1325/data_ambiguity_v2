@@ -2,106 +2,211 @@
 
 ## Project Overview
 
-This project fine-tunes Microsoft's CodeBERT model using adapters to classify JSON schema data. It utilizes PyTorch, Hugging Face's Transformers, and AdapterHub to train and evaluate the model. The project is configured to log training and evaluation metrics using Weights & Biases (wandb).
+This project fine-tunes Microsoft's CodeBERT model using adapters to classify JSON data as static or dynamic. It utilizes PyTorch, Hugging Face's Transformers, and AdapterHub to train and evaluate the model. The project is configured to log training and evaluation metrics using Weights & Biases (wandb).
 
-## Features
+## File: `get_data.py`
 
-- Fine-tunes CodeBERT using adapters.
-- Implements early stopping to prevent overfitting.
-- Uses gradient accumulation for efficient training.
-- Supports multi-GPU training.
-- Logs training progress and evaluation metrics with wandb.
-- Provides functions for training, testing, and evaluating the model.
+**Purpose:**  
+This script processes raw JSON datasets and their corresponding JSON Schemas to prepare them for downstream tasks, such as static vs. dynamic key classification. It performs several preprocessing steps to ensure schemas and JSON documents are fully dereferenced, valid, and structured consistently. The output is saved in designated directories for further analysis or model input.
 
-## Requirements
+Key functionalities include:
 
-Ensure the following dependencies are installed:
+### 1. Schema Loading and Dereferencing
+- `load_schema(schema_path)`:
+  - Loads a JSON schema from a file.
+  - Returns the schema as a Python dictionary or `None` if loading fails.
 
-```sh
-pip install torch transformers adapter-transformers scikit-learn pandas numpy wandb tqdm
+- `load_and_dereference_schema(schema_path)`:
+  - Fully dereferences all `$ref` references in a JSON schema using `jsonref`.
+  - Converts `JsonRef` objects to plain Python `dict`/`list` structures.
+  - Ensures the schema is usable for static and dynamic key extraction.
+
+- `deref_to_dict(obj)`:
+  - Recursive helper to convert `JsonRef` objects to plain Python types.
+
+- `save_schema(dereferenced_schema, dataset_name)`:
+  - Saves the dereferenced schema to the `processed_schemas` folder.
+
+### 2. JSON Dataset Processing
+- `process_documents(dataset_name, dataset_path)`:
+  - Reads JSON lines from a dataset file.
+  - Validates that each line is an object or array.
+  - Writes valid documents to `processed_jsons` folder.
+
+- `process_single_dataset(dataset_name)`:
+  - Processes both the schema and dataset for a single dataset.
+  - Performs existence check, emptiness check, schema loading, dereferencing, saving, and document processing.
+  - Returns success flags for each step.
+
+- `process_datasets(max_workers=8)`:
+  - Processes all datasets concurrently using a `ThreadPoolExecutor`.
+  - Tracks metrics for existence, non-empty datasets, successful schema loading, dereferencing, and overall success.
+  - Prints a summary of dataset processing statistics.
+
+### 3. Directory Management
+- `recreate_directory(directory_path)`:
+  - Deletes and recreates a directory to ensure a clean output folder.
+
+### 4. Main Execution
+- Processes all schemas and JSON datasets in the predefined directories (`SCHEMA_FOLDER` and `JSON_FOLDER`).
+- Saves processed schemas and datasets in `processed_schemas` and `processed_jsons`.
+- Measures and prints total processing time.
+
+**How to run:**  
+```bash
+python get_data.py
+
+
 ```
 
-## Directory Structure
+## File: `convert_schemas.js`
 
-- `converted_processed_schemas/` - Folder containing processed schema files.
-- `processed_jsons/` - Folder containing processed JSON files.
-- `adapter-model/` - Directory where trained adapters are saved.
+**Purpose:**  
+This script standardizes JSON Schemas to the **draft-2020-12** version using the [AlterSchema](https://github.com/sourcemeta-research/alterschema) tool.  
+It ensures that all schemas, regardless of their original draft (draft-03, draft-04, draft-06, draft-07, 2019-09), are converted to a common format for downstream processing.  
+If a schema is already in draft-2020-12, it is simply copied to the output directory.
 
-## Model Training
+**Key features:**
+- Reads schemas from a specified directory (`./processed_schemas` by default).  
+- Detects the current draft version using the `$schema` field.  
+- Converts schemas to draft-2020-12 using AlterSchema CLI, if needed.  
+- Copies schemas already in draft-2020-12 to the output directory.   
 
-To train the model, call:
-
-```python
-train_model(train_df, test_df)
+**How to run:**
+1. Install AlterSchema (if not installed):
+```bash
+npm install -g @sourcemeta/alterschema
+```
+2. Run the script:
+```bash
+node convert_schemas.js
 ```
 
-where `train_df` and `test_df` are Pandas DataFrames containing schema data and labels.
+**Directories used/created:**
+- `schemaDir` (`./processed_schemas`): Input folder containing JSON schemas to convert.  
+- `outputDir` (`./converted_processed_schemas`): Output folder where converted schemas are saved.
 
-## Model Evaluation
+**Notes:**
+- Only `.json` files in the input directory are processed.  
+- Unrecognized or unsupported draft versions are skipped with a log message.
 
-To evaluate a trained model:
 
-```python
-evaluate_model(test_df)
+## File: `process_data.py`
+
+**Purpose:**  
+Preprocess JSON documents and schemas to generate labeled datasets for static vs. dynamic key classification. Extracts paths, computes features, labels paths, and balances classes for training/testing.
+
+**Key Functions:**
+
+- `split_data(train_ratio, random_value)` – Split schemas into train/test sets.  
+- `load_schema(schema_path)` – Load a JSON schema.  
+- `get_static_paths(schema)` – Extract static paths where `additionalProperties` is `False`.  
+- `process_document(doc, path_types, path_freqs)` – Extract paths and track frequency/type information.  
+- `create_dataframe(path_values, path_freqs, dataset)` – Convert extracted paths into a DataFrame with features.  
+- `label_paths(df, static_paths)` – Label paths as static (`0`) or dynamic (`1`).  
+- `resample_data(df, random_value)` – Balance classes using oversampling.  
+- `process_dataset(dataset)` / `preprocess_data(schema_list)` – Process datasets and generate final DataFrames.  
+
+**Output:**  
+- `train_data.csv` – Labeled and resampled training set.  
+- `test_data.csv` – Labeled testing set.  
+- Optional: `train_jsons/` and `test_jsons/` containing valid documents.
+
+**Usage:**  
+```bash
+python process_data.py <train_size> <random_value>
+
+
 ```
 
-This function loads the trained adapter and computes evaluation metrics.
+## File: `model.py`
 
-## Key Components
+## Purpose
+Classifies JSON schema keys as **static** or **dynamic** using a CodeBERT model with numeric features.
 
-### Early Stopping
+## Training Modes
+1. **Adapter**: Fine-tunes only an adapter added to CodeBERT.
+2. **Full**: Fully fine-tunes CodeBERT.
+3. **Jxplain**: Rule-based baseline using entropy thresholds.
 
-The `EarlyStopper` class monitors validation loss and stops training if no improvement is observed after a specified number of epochs.
+## Running
+- **Train**: `train_model(train_df, test_df, mode="adapter"|"full")`
+- **Evaluate**: `evaluate_model(test_df, eval_mode="adapter"|"full")`
+- **Jxplain**: `run_jxplain(test_df, eval_mode="jxplain")`
 
-### Dataset and Tokenization
+### CLI Usage
+```bash
+python model.py <train_data.csv> <test_data.csv> <mode> [adapter|full|jxplain]
 
-The `CustomDataset` class handles tokenizing JSON schema data for CodeBERT, ensuring it fits within the model's maximum token length.
-
-### Training Process
-
-- Initializes CodeBERT with an adapter (`data_ambiguity`).
-- Freezes the base model and trains only adapter layers.
-- Uses the AdamW optimizer and linear learning rate scheduler.
-- Implements gradient accumulation for stable training.
-- Logs losses and metrics using wandb.
-
-### Testing
-
-- Evaluates the trained model on the test dataset.
-- Computes accuracy, precision, recall, and F1-score.
-- Logs metrics in wandb.
-
-## Logging with Weights & Biases
-
-wandb is used to track training progress and evaluation metrics. Initialize it with:
-
-```python
-wandb.init(project="custom-codebert_all_files_25")
 ```
 
-Make sure to set up a wandb account and log in before running training.
+## File: `transform_schema.py`
 
-## Saving and Loading Model
+## Purpose
+Transforms JSON schemas inferred from datasets (e.g., Baazizi-style) by **removing dynamic keys** and merging their definitions into `additionalProperties`. This reduces redundancy while preserving schema constraints. Can operate based on:
 
-- The trained adapter is saved in `adapter-model/`.
-- The `load_model_and_adapter()` function loads the saved model for evaluation.
+- Ground truth dynamic keys (`gt`)
+- Predictions from trained models (`adapter` or `full`)
+- Rule-based method (`jxplain`)
 
-## Hyperparameters
+## Key Functions
 
-- **Batch Size:** 64
-- **Max Token Length:** 512
-- **Learning Rate:** 2e-5
-- **Gradient Accumulation Steps:** 4
-- **Epochs:** 25
+### 1. Path & Schema Utilities
+- `normalize_dynamic_paths`: Converts string paths to tuples and sorts them bottom-up.
+- `normalize_additional_properties`: Ensures `additionalProperties` is a dict.
+- `merge_dynamic_schema`: Merges dynamic key schemas into `additionalProperties`.
+- `resolve_ref`: Follows internal `$ref` pointers in a schema.
+- `process_path`: Recursively traverses a schema to remove dynamic keys, handling:
+  - Objects (`properties`)
+  - Arrays (`items`, `prefixItems`)
+  - Schema combinators (`anyOf`, `oneOf`, `allOf`)
 
-## Running on Multiple GPUs
+### 2. Schema Transformation
+- `transform_schema_with_dynamic_keys(schema, dynamic_paths)`: Applies `process_path` for all dynamic paths, producing a transformed schema.
 
-If multiple GPUs are available, the script automatically distributes training across them using `nn.DataParallel`.
+### 3. Schema Metrics
+- `get_schema_size`: Returns size in bytes (without whitespace).
+- `compare_schema_sizes`: Returns size difference between original and transformed schemas.
 
-## Notes
+### 4. File I/O
+- `load_schema` / `save_schema`: Read/write JSON schemas.
+- `process_single_dataset`: Loads a schema, gets dynamic paths (from predictions or ground truth), transforms the schema, compares sizes, and saves it.
 
-- Ensure `torch.cuda.is_available()` returns `True` to leverage GPU acceleration.
-- The dataset should contain `schema` (JSON object) and `label` (integer) columns.
+## Running the Script
+
+- **CLI Usage**
+```bash
+python transform_schema.py <inferred_schemas_dir> <eval_input_dir> <mode>
+```
+
+
+## Dependencies
+
+- **Python 3.10+**  
+- **NumPy** (`numpy`)  
+- **Pandas** (`pandas`)  
+- **PyTorch** (`torch`)  
+- **Huggingface Transformers** (`transformers`)  
+- **tqdm** (`tqdm`)  
+- **Scikit-learn** (`scikit-learn`)  
+- **Accelerate** (`accelerate`)  
+- **Weights & Biases** (`wandb`)  
+- **Adapters library** (`adapters`)  
+- **JSON Reference handling** (`jsonref`)  
+
+**Standard library modules used:**  
+- `argparse`, `ast`, `os`, `sys`, `time`, `math`, `shutil`, `copy` (`deepcopy`)  
+- `collections` (`OrderedDict`)  
+- `itertools` (`combinations`)  
+- `torch.multiprocessing` as `mp`  
+- `torch.nn` and `torch.nn.functional` (`nn`, `F`)  
+- `torch.optim` (`AdamW`)  
+- `torch.utils.data` (`DataLoader`, `Dataset`)  
+
+### Install packages
+```bash
+uv install numpy pandas torch transformers tqdm scikit-learn accelerate wandb adapters jsonref
+
 
 ## Citation
 
