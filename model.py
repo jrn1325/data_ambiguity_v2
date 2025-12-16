@@ -479,7 +479,126 @@ def load_model_and_adapter(training_mode="adapter"):
 
 
 
+def resolve_ref(ref, root_schema):
+    """
+    Resolves an internal $ref like '#/definitions/User'.
+    Returns a pointer directly to the referenced dict.
+    """
+    assert ref.startswith("#/"), "Only internal refs supported."
+    path = ref[2:].split("/")  # e.g., ['definitions', 'User']
+    target = root_schema
+    for p in path:
+        if p in target:
+            target = target[p]
+        else:
+            return None
+    return target
 
+def is_static_path(schema, keys, root_schema):
+    """
+    Traverse a schema following a path and return 0 (static) or 1 (dynamic).
+    A path is static if additionalProperties=False at the object containing the final key.
+    Args:
+        schema (dict): JSON schema.
+        keys (list): List of keys representing the path.
+        root_schema (dict): The root schema for resolving $ref.
+    Returns:
+        int: 0 if static, 1 if dynamic.
+    """
+    if not keys:
+        return 0 if schema.get("additionalProperties") is False else 1
+
+    # Resolve $ref
+    if "$ref" in schema:
+        resolved = resolve_ref(schema["$ref"], root_schema)
+        if resolved is None:
+            return 1
+        return is_static_path(resolved, keys, root_schema)
+
+    key = keys[0]
+    remaining = keys[1:]
+
+    # Handle object
+    if schema.get("type") == "object":
+        props = schema.get("properties", {})
+        pattern_props = schema.get("patternProperties", {})
+
+        if key in props:
+            return is_static_path(props[key], remaining, root_schema)
+        elif pattern_props:
+            # If any pattern matches, take first one
+            return is_static_path(list(pattern_props.values())[0], remaining, root_schema)
+        else:
+            # Key not defined => dynamic
+            return 1
+
+    # Handle array
+    elif schema.get("type") == "array":
+        if "items" in schema:
+            return is_static_path(schema["items"], remaining, root_schema)
+        if "prefixItems" in schema:
+            for subschema in schema["prefixItems"]:
+                return is_static_path(subschema, remaining, root_schema)
+
+    # Handle combinators
+    for combiner in ("anyOf", "oneOf", "allOf"):
+        if combiner in schema:
+            # Dynamic if any subschema is dynamic
+            for subschema in schema[combiner]:
+                result = is_static_path(subschema, keys, root_schema)
+                if result == 1:
+                    return 1
+            return 0
+
+    # Unknown schema type => dynamic
+    return 1
+
+def run_recg(test_df, schemas_dir, eval_mode="jxplain", output_dir="evaluation_results"):
+    """
+    Predict static/dynamic using the correct JSON schema per file.
+    """
+
+    # Load all schemas into a dictionary: filename -> schema
+    schemas = {}
+    for schema_file in os.listdir(schemas_dir):
+        full_path = os.path.join("ReCG_schemas", schema_file)
+        with open(full_path, 'r') as f:
+            schema_data = json.load(f)
+        filename = os.path.splitext(schema_file)[0]
+        schemas[filename] = schema_data
+
+    # Compute predictions per row using the correct schema
+    y_pred = []
+    for row in test_df.itertuples(index=False):
+        schema = schemas.get(os.path.splitext(row.filename)[0])
+        print(row.path, type(ast.literal_eval(row.path)), flush=True)
+        y_pred.append(is_static_path(schema, ast.literal_eval(row.path), schema))
+
+    y_test = test_df["label"]
+
+    # --- Metrics ---
+    overall_accuracy = accuracy_score(y_test, y_pred)
+    precision, recall, f1_score, _ = precision_recall_fscore_support(y_test, y_pred, average=None, labels=[0,1])
+    combined_precision, combined_recall, combined_f1, _ = precision_recall_fscore_support(y_test, y_pred, average='weighted')
+    positive_accuracy = accuracy_score(y_test[y_test==1], [p for p,t in zip(y_pred, y_test) if t==1])
+    negative_accuracy = accuracy_score(y_test[y_test==0], [p for p,t in zip(y_pred, y_test) if t==0])
+
+    print(f"Class 0 (Static) - Precision: {precision[0]:.4f}, Recall: {recall[0]:.4f}, F1 Score: {f1_score[0]:.4f}, Accuracy: {negative_accuracy:.4f}")
+    print(f"Class 1 (Dynamic) - Precision: {precision[1]:.4f}, Recall: {recall[1]:.4f}, F1 Score: {f1_score[1]:.4f}, Accuracy: {positive_accuracy:.4f}")
+    print(f"Both Classes (Overall) - Precision: {combined_precision:.4f}, Recall: {combined_recall:.4f}, F1 Score: {combined_f1:.4f}, Accuracy: {overall_accuracy:.4f}")
+
+    # --- Save per-file results ---
+    result_df = test_df.copy()
+    result_df["pred"] = y_pred
+    result_df["correct"] = result_df["pred"] == result_df["label"]
+
+    output_dir = output_dir + '_' + eval_mode
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for filename, group in result_df.groupby("filename"):
+        file_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_results.csv")
+        group.to_csv(file_path, index=False, sep=';')
+        print(f"Saved: {file_path} ({len(group)} rows)")
 def run_jxplain(test_df, eval_mode="jxplain", output_dir="evaluation_results"):
     """
     Perform the Jxplain method to classify dynamic keys based on datatype entropy 
@@ -535,10 +654,10 @@ def main():
     try:
         train_data, test_data, mode, *extra = sys.argv[-4:]
         version = extra[0].lower() if extra else "adapter"
-        if version not in {"adapter", "full", "jxplain"}:
-            raise ValueError("Invalid training mode. Use 'adapter', 'full', or 'jxplain'.")
-        if mode not in {"train", "eval", "jxplain"}:
-            raise ValueError("Invalid mode. Use 'train', 'eval', or 'jxplain'.")
+        if version not in {"adapter", "full", "jxplain", "recg"}:
+            raise ValueError("Invalid training mode. Use 'adapter', 'full', 'jxplain', or 'recg'.")
+        if mode not in {"train", "eval", "jxplain", "recg"}:
+            raise ValueError("Invalid mode. Use 'train', 'eval', 'jxplain', or 'recg'.")
 
         if mode == "train":
             train_df = pd.read_csv(train_data, delimiter=';')
@@ -552,12 +671,16 @@ def main():
                 model = nn.DataParallel(model)
             model.to(device)
             evaluate_model(test_df, eval_mode=version)
-        else:
+        elif mode == "jxplain":
             test_df = pd.read_csv(test_data, delimiter=';')
             run_jxplain(test_df, eval_mode=version, output_dir="evaluation_results")
+        elif mode == "recg":
+            schemas_dir = "test_jsons"
+            test_df = pd.read_csv(test_data, delimiter=';')
+            run_recg(test_df, schemas_dir, eval_mode=version, output_dir="evaluation_results")
 
     except (ValueError, IndexError) as e:
-        print(f"Error: {e}\nUsage: script.py <train_data> <test_data> <mode> [adapter|full|jxplain]")
+        print(f"Error: {e}\nUsage: script.py <train_data> <test_data> <mode> [adapter|full|jxplain|recg]")
         sys.exit(1)
 
 if __name__ == "__main__":
