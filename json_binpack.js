@@ -74,8 +74,11 @@ const loadSchemas = (dir) => {
 // -------------------------
 const main = async () => {
   const schemas = loadSchemas(schemaDir)
-  let size = 0
+  let totalDataSize = 0
+  let totalSchemaSize = 0
+  let averageSize = 0
   let schemaCount = 0
+  let count = 0
 
   for (const [schemaPath, schema] of Object.entries(schemas)) {
     const fileName = path.basename(schemaPath)
@@ -99,8 +102,8 @@ const main = async () => {
       continue
     }
 
-    let totalSize = 0
-    let count = 0
+    const currentSchemaSize = Buffer.byteLength(JSON.stringify(schema), 'utf-8')
+    totalSchemaSize += currentSchemaSize
 
     try {
       const encodingSchema = await jsonbinpack.compileSchema(schema)
@@ -109,7 +112,7 @@ const main = async () => {
       for (const doc of documents) {
         try {
           const buffer = jsonbinpack.serialize(encodingSchema, doc)
-          totalSize += buffer.length
+          totalDataSize += buffer.length
           count++
         } catch (err) {
           // Document doesn't conform → skip
@@ -117,11 +120,11 @@ const main = async () => {
       }
 
       if (count > 0) {
-        const average = totalSize / count
+        const average = totalDataSize / count
         console.log(
           `Dataset: ${baseName} | Docs: ${count} | Avg size: ${average.toFixed(2)} bytes`
         )
-        size += average
+        averageSize += average
       }
     } catch (err) {
       console.error(`Failed to process schema ${baseName}:`, err.message)
@@ -129,7 +132,8 @@ const main = async () => {
   }
 
   if (schemaCount > 0) {
-    console.log(`Overall average size: ${(size / schemaCount).toFixed(2)} bytes`)
+    console.log(`Overall average doc size: ${(averageSize / schemaCount).toFixed(2)} bytes`)
+    console.log(`Overall average schema size: ${(totalSchemaSize / schemaCount).toFixed(2)} bytes`)
   } else {
     console.log('No schemas processed.')
   }
