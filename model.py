@@ -500,7 +500,7 @@ def is_static_path(schema, keys, root_schema):
     A path is static if additionalProperties=False at the object containing the final key.
     Args:
         schema (dict): JSON schema.
-        keys (list): List of keys representing the path.
+        keys (tuple): Path keys to traverse.
         root_schema (dict): The root schema for resolving $ref.
     Returns:
         int: 0 if static, 1 if dynamic.
@@ -517,6 +517,16 @@ def is_static_path(schema, keys, root_schema):
 
     key = keys[0]
     remaining = keys[1:]
+
+    # Handle combinators
+    for combiner in ("anyOf", "oneOf", "allOf"):
+        if combiner in schema:
+            # Dynamic if any subschema is dynamic
+            for subschema in schema[combiner]:
+                result = is_static_path(subschema, keys, root_schema)
+                if result == 1:
+                    return 1
+            return 0
 
     # Handle object
     if schema.get("type") == "object":
@@ -540,15 +550,7 @@ def is_static_path(schema, keys, root_schema):
             for subschema in schema["prefixItems"]:
                 return is_static_path(subschema, remaining, root_schema)
 
-    # Handle combinators
-    for combiner in ("anyOf", "oneOf", "allOf"):
-        if combiner in schema:
-            # Dynamic if any subschema is dynamic
-            for subschema in schema[combiner]:
-                result = is_static_path(subschema, keys, root_schema)
-                if result == 1:
-                    return 1
-            return 0
+    
 
     # Unknown schema type => dynamic
     return 1
@@ -571,9 +573,9 @@ def run_recg(test_df, schemas_dir, eval_mode="jxplain", output_dir="evaluation_r
     y_pred = []
     for row in test_df.itertuples(index=False):
         schema = schemas.get(os.path.splitext(row.filename)[0])
-        print(row.path, type(ast.literal_eval(row.path)), flush=True)
         y_pred.append(is_static_path(schema, ast.literal_eval(row.path), schema))
-
+        print(f"Processed {row.filename} with path {row.path} -> Prediction: {y_pred[-1]}")
+   
     y_test = test_df["label"]
 
     # --- Metrics ---
@@ -599,6 +601,7 @@ def run_recg(test_df, schemas_dir, eval_mode="jxplain", output_dir="evaluation_r
         file_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_results.csv")
         group.to_csv(file_path, index=False, sep=';')
         print(f"Saved: {file_path} ({len(group)} rows)")
+
 def run_jxplain(test_df, eval_mode="jxplain", output_dir="evaluation_results"):
     """
     Perform the Jxplain method to classify dynamic keys based on datatype entropy 
