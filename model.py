@@ -496,24 +496,29 @@ def resolve_ref(ref, root_schema):
 
 def is_static_path(schema, keys, root_schema):
     """
-    Traverse a schema following a path and return 0 (static) or 1 (dynamic).
-    A path is static if additionalProperties=False at the object containing the final key.
+    Determines if the given path (list of keys) is static (0) or dynamic (1)
+    according to the provided JSON schema.
+
     Args:
-        schema (dict): JSON schema.
-        keys (tuple): Path keys to traverse.
-        root_schema (dict): The root schema for resolving $ref.
+        schema (dict): Current JSON schema node.
+        keys (list): List of keys representing the path.
+        root_schema (dict): The root JSON schema for resolving $refs.
     Returns:
         int: 0 if static, 1 if dynamic.
     """
-    if not keys:
-        return 0 if schema.get("additionalProperties") is False else 1
+
+    # Strip root marker
+    if keys and keys[0] == "$":
+        return is_static_path(schema, keys[1:], root_schema)
 
     # Resolve $ref
     if "$ref" in schema:
         resolved = resolve_ref(schema["$ref"], root_schema)
-        if resolved is None:
-            return 1
-        return is_static_path(resolved, keys, root_schema)
+        return 1 if resolved is None else is_static_path(resolved, keys, root_schema)
+
+    # No more keys to process
+    if not keys:
+        return 0 if schema.get("additionalProperties") is False else 1
 
     key = keys[0]
     remaining = keys[1:]
@@ -521,41 +526,40 @@ def is_static_path(schema, keys, root_schema):
     # Handle combinators
     for combiner in ("anyOf", "oneOf", "allOf"):
         if combiner in schema:
-            # Dynamic if any subschema is dynamic
             for subschema in schema[combiner]:
-                result = is_static_path(subschema, keys, root_schema)
-                if result == 1:
+                if is_static_path(subschema, keys, root_schema) == 1:
                     return 1
             return 0
 
     # Handle object
     if schema.get("type") == "object":
         props = schema.get("properties", {})
-        pattern_props = schema.get("patternProperties", {})
 
+        # Object contains the final key
+        if len(keys) == 1:
+            return 0 if schema.get("additionalProperties") is False else 1
+
+        # Descend through declared properties
         if key in props:
             return is_static_path(props[key], remaining, root_schema)
-        elif pattern_props:
-            # If any pattern matches, take first one
-            return is_static_path(list(pattern_props.values())[0], remaining, root_schema)
-        else:
-            # Key not defined => dynamic
-            return 1
 
-    # Handle array
-    elif schema.get("type") == "array":
+        # Key not declared
+        return 0 if schema.get("additionalProperties") is False else 1
+
+    # Handle arrays
+    if schema.get("type") == "array":
         if "items" in schema:
-            return is_static_path(schema["items"], remaining, root_schema)
+            return is_static_path(schema["items"], keys, root_schema)
         if "prefixItems" in schema:
             for subschema in schema["prefixItems"]:
-                return is_static_path(subschema, remaining, root_schema)
+                if is_static_path(subschema, keys, root_schema) == 1:
+                    return 1
+            return 0
 
-    
-
-    # Unknown schema type => dynamic
     return 1
 
-def run_recg(test_df, schemas_dir, eval_mode="jxplain", output_dir="evaluation_results"):
+
+def run_recg(test_df, schemas_dir, eval_mode="recg", output_dir="evaluation_results"):
     """
     Predict static/dynamic using the correct JSON schema per file.
     """
